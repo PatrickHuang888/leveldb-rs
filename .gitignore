@@ -1,0 +1,25 @@
+# Rust build
+/target/
+**/*.rs.bk
+
+# IDE
+/.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Cargo
+Cargo.lock
+
+# Logs
+*.log
+
+# By-products
+*.dSYM/
+*.profraw
+
+# Test output
+/tests/output/

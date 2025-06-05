@@ -47,7 +47,7 @@ impl<K> SkipList<K>
 where
     K: Key,
 {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         let head = Node::new(K::default(), MAX_HEIGHT);
         let end = Node::new(K::default(), MAX_HEIGHT);
         let arena = vec![head, end];
@@ -173,11 +173,11 @@ where
 
         let new = self.new_node(key, height);
         for i in 0..height {
-            let prev_next = self.arena[prev[i as usize]].no_barrier_next(i as usize);
+            let prev_i = &self.arena[prev[i as usize]];
             // NoBarrier_SetNext() suffices since we will add a barrier when
             // we publish a pointer to "x" in prev[i].
-            self.arena[new].no_barrier_set_next(i as usize, prev_next);
-            self.arena[prev[i as usize]].set_next(i as usize, new);
+            self.arena[new].no_barrier_set_next(i as usize, prev_i.no_barrier_next(i as usize));
+            prev_i.set_next(i as usize, new);
         }
     }
 
@@ -336,6 +336,47 @@ mod tests {
             nums_sorted_rev.reverse();
             assert_eq!(rev_result, nums_sorted_rev);
         }
+
+        // seek 测试
+        let mut iter = skiplist.iter();
+        // seek 到已存在的 key
+        if !nums_sorted.is_empty() {
+            let mid = nums_sorted[nums_sorted.len() / 2];
+            iter.seek(&IntKey(mid));
+            assert!(iter.valid());
+            assert_eq!(iter.key().unwrap().0, mid);
+
+            // seek 到比最小 key 小的 key，应指向最小 key
+            let min = *nums_sorted.first().unwrap();
+            iter.seek(&IntKey(min - 1));
+            assert!(iter.valid());
+            assert_eq!(iter.key().unwrap().0, min);
+
+            // seek 到比最大 key 大的 key，应 invalid
+            let max = *nums_sorted.last().unwrap();
+            iter.seek(&IntKey(max + 1));
+            assert!(!iter.valid());
+
+            // 随机 seek 测试
+            let mut rng = rand::thread_rng();
+            for _ in 0..20 {
+                let idx = rng.gen_range(0..nums_sorted.len());
+                let target = nums_sorted[idx];
+                iter.seek(&IntKey(target));
+                assert!(iter.valid());
+                assert_eq!(iter.key().unwrap().0, target);
+
+                // 随机 seek 到不存在的 key，应该指向下一个更大的 key或invalid
+                let fake = target - 1;
+                iter.seek(&IntKey(fake));
+                if let Some(&next) = nums_sorted.iter().find(|&&x| x >= fake) {
+                    assert!(iter.valid());
+                    assert_eq!(iter.key().unwrap().0, next);
+                } else {
+                    assert!(!iter.valid());
+                }
+            }
+        }
     }
 
     #[test]
@@ -471,7 +512,7 @@ mod tests {
                                 snapshot[pos.id]
                             );
                             // Advance to next key in the valid key space
-                            if pos < current {
+                            if pos.id < current.id {
                                 pos = make_key(pos.id + 1, 0);
                             } else {
                                 pos = make_key(pos.id, pos.generation + 1);

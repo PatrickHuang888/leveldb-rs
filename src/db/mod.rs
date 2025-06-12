@@ -1,3 +1,4 @@
+mod db_impl;
 mod dbformat;
-pub mod memtable;
+mod memtable;
 mod skiplist;

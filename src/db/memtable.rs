@@ -1,3 +1,4 @@
+use super::dbformat::DBError;
 use super::dbformat::VALUE_TYPE_FOR_SEEK;
 use super::dbformat::ValueType;
 use super::dbformat::decode_varint32;
@@ -9,32 +10,7 @@ use crate::db::dbformat::LookupKey;
 use crate::db::dbformat::SequenceNumber;
 use crate::db::dbformat::TableKey;
 
-#[derive(Debug)]
-pub enum MemTableError {
-    NotFound,
-    NotSupported,
-    Corruption,
-    IoError(std::io::Error),
-}
-
-impl From<std::io::Error> for MemTableError {
-    fn from(e: std::io::Error) -> Self {
-        MemTableError::IoError(e)
-    }
-}
-
-impl std::fmt::Display for MemTableError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            MemTableError::NotFound => write!(f, "Not found"),
-            MemTableError::NotSupported => write!(f, "Not supported"),
-            MemTableError::Corruption => write!(f, "Corruption"),
-            MemTableError::IoError(e) => write!(f, "IO error: {}", e),
-        }
-    }
-}
-
-struct MemtableKey {
+pub(super) struct MemtableKey {
     user_key: Vec<u8>,
     sequence: SequenceNumber,
     value_type: ValueType,
@@ -129,20 +105,19 @@ impl Default for MemtableKey {
 impl Key for MemtableKey {}
 
 type Table = SkipList<MemtableKey>;
-pub struct MemTable {
+pub(super) struct MemTable {
     table: Table,
 }
 
-impl std::error::Error for MemTableError {}
-
 impl MemTable {
-    fn new() -> Self {
+    pub fn new() -> Self {
         MemTable {
             table: SkipList::new(),
         }
     }
 
-    fn get(&self, user_key: &[u8], s: SequenceNumber) -> Result<Option<Vec<u8>>, MemTableError> {
+    // 返回 None 表示没找到，NotFound 错误表示删除了
+    pub fn get(&self, user_key: &[u8], s: SequenceNumber) -> Result<Option<Vec<u8>>, DBError> {
         let key = MemtableKey::new(user_key, s, VALUE_TYPE_FOR_SEEK, &[]);
         let mut iter = self.table.iter();
         iter.seek(&key);
@@ -151,7 +126,14 @@ impl MemTable {
             if entry.user_key() == user_key {
                 match entry.value_type() {
                     ValueType::TypeValue => Ok(Some(entry.value().to_vec())),
-                    ValueType::TypeDeletion => Err(MemTableError::NotFound),
+                    ValueType::TypeDeletion => Err(DBError::NotFound),
+                    _ => {
+                        panic!(
+                            "Unexpected value type: {:?} for key: {:?}",
+                            entry.value_type(),
+                            String::from_utf8_lossy(entry.user_key())
+                        );
+                    }
                 }
             } else {
                 Ok(None)
@@ -161,7 +143,7 @@ impl MemTable {
         }
     }
 
-    fn add(&mut self, s: SequenceNumber, t: ValueType, user_key: &[u8], value: &[u8]) {
+    pub fn add(&mut self, s: SequenceNumber, t: ValueType, user_key: &[u8], value: &[u8]) {
         let key = MemtableKey::new(user_key, s, t, value);
         self.table.insert(&key);
     }
@@ -171,7 +153,7 @@ impl MemTable {
     }
 }
 
-struct MemTableIter<'a> {
+pub(super) struct MemTableIter<'a> {
     inner: SkipListIter<'a, MemtableKey>,
 }
 
@@ -187,9 +169,8 @@ impl<'a> MemTableIter<'a> {
     pub fn seek_to_last(&mut self) {
         self.inner.seek_to_last();
     }
-    pub fn seek(&mut self, user_key: &[u8]) {
-        // 查找 user_key 的最大 sequence
-        let lookup_key = MemtableKey::new(user_key, u64::MAX, ValueType::TypeValue, &[]);
+    pub fn seek(&mut self, user_key: &[u8], sequence: SequenceNumber, value_type: ValueType) {
+        let lookup_key = MemtableKey::new(user_key, sequence, value_type, &[]);
         self.inner.seek(&lookup_key);
     }
     pub fn valid(&self) -> bool {
@@ -305,7 +286,7 @@ mod tests {
             (b"0", Some(b"a")),                       // 小于所有 key，lower_bound
         ];
         for (seek_key, expect_key) in seek_cases.iter() {
-            iter.seek(seek_key);
+            iter.seek(seek_key, u64::MAX, ValueType::TypeValue);
             if let Some(expect) = expect_key {
                 assert!(
                     iter.valid(),

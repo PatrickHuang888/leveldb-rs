@@ -26,7 +26,11 @@ use std::{
     u8, vec,
 };
 
-pub trait Key: Ord + Clone + Default {}
+pub trait Size {
+    fn size(&self) -> usize;
+}
+
+pub trait Key: Ord + Size + Clone + Default {}
 
 const MAX_HEIGHT: u8 = 12;
 const HEAD: usize = 1;
@@ -184,6 +188,17 @@ where
     pub fn iter(&self) -> SkipListIter<K> {
         SkipListIter::new(self)
     }
+
+    pub fn approximate_size(&self) -> usize {
+        self.arena
+            .iter()
+            .map(|node| {
+                std::mem::size_of_val(node)
+                    + node.key.size()
+                    + node.indexes.capacity() * std::mem::size_of::<usize>()
+            })
+            .sum()
+    }
 }
 
 struct Node<Key> {
@@ -293,6 +308,11 @@ mod tests {
     struct IntKey(i32);
 
     impl Key for IntKey {}
+    impl Size for IntKey {
+        fn size(&self) -> usize {
+            std::mem::size_of::<i32>()
+        }
+    }
 
     #[test]
     fn test_insert_and_contains_random() {
@@ -420,6 +440,11 @@ mod tests {
             }
         }
         impl Key for TestKey {}
+        impl Size for TestKey {
+            fn size(&self) -> usize {
+                std::mem::size_of::<usize>() * 2 + std::mem::size_of::<u64>()
+            }
+        }
 
         fn make_key(id: usize, generation: usize) -> TestKey {
             let hash = (id as u64)

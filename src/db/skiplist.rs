@@ -22,6 +22,7 @@
 // ... prev vs. next pointer ordering ...
 
 use std::{
+    sync::Arc,
     sync::atomic::{AtomicU8, AtomicUsize},
     u8, vec,
 };
@@ -185,10 +186,6 @@ where
         }
     }
 
-    pub fn iter(&self) -> SkipListIter<K> {
-        SkipListIter::new(self)
-    }
-
     pub fn approximate_size(&self) -> usize {
         self.arena
             .iter()
@@ -232,19 +229,19 @@ impl<Key> Node<Key> {
     }
 }
 
-pub struct SkipListIter<'a, K>
+pub struct SkipListIter<K>
 where
     K: Key,
 {
-    list: &'a SkipList<K>,
+    list: Arc<SkipList<K>>,
     current: usize,
 }
 
-impl<'a, K> SkipListIter<'a, K>
+impl<K> SkipListIter<K>
 where
     K: Key,
 {
-    pub fn new(list: &'a SkipList<K>) -> Self {
+    pub fn new(list: Arc<SkipList<K>>) -> Self {
         SkipListIter {
             list,
             current: TAIL,
@@ -270,7 +267,7 @@ where
         self.current != TAIL
     }
 
-    pub fn key(&self) -> Option<&'a K> {
+    pub fn key(&self) -> Option<&K> {
         if self.valid() {
             Some(self.list.arena[self.current].get_key())
         } else {
@@ -332,7 +329,8 @@ mod tests {
             assert!(skiplist.contains(&IntKey(*n)), "Should contain {}", n);
         }
         // 正序遍历 skiplist，收集所有 key
-        let mut iter = skiplist.iter();
+        let list = Arc::new(skiplist);
+        let mut iter = SkipListIter::new(Arc::clone(&list));
         iter.seek_to_first();
         let mut result = vec![];
         while iter.valid() {
@@ -345,7 +343,7 @@ mod tests {
         assert_eq!(result, nums_sorted);
         // 逆序遍历 skiplist，收集所有 key
         if !result.is_empty() {
-            let mut iter = skiplist.iter();
+            let mut iter = SkipListIter::new(Arc::clone(&list));
             iter.seek_to_last();
             let mut rev_result = vec![];
             while iter.valid() {
@@ -358,7 +356,7 @@ mod tests {
         }
 
         // seek 测试
-        let mut iter = skiplist.iter();
+        let mut iter = SkipListIter::new(Arc::clone(&list));
         // seek 到已存在的 key
         if !nums_sorted.is_empty() {
             let mid = nums_sorted[nums_sorted.len() / 2];
@@ -513,8 +511,7 @@ mod tests {
                         .collect();
 
                     let start_key = random_target(&mut rng);
-                    let list = unsafe { &*Arc::as_ptr(&skiplist_reader) };
-                    let mut iter = list.iter();
+                    let mut iter = SkipListIter::new(Arc::clone(&skiplist_reader));
                     iter.seek(&start_key);
 
                     let mut pos = start_key.clone();

@@ -1,30 +1,28 @@
 use super::dbformat::DBError;
 use super::dbformat::VALUE_TYPE_FOR_SEEK;
 use super::dbformat::ValueType;
-use super::dbformat::decode_varint32;
-use super::dbformat::encode_varint32;
 use super::skiplist::Key;
 use super::skiplist::SkipList;
 use super::skiplist::SkipListIter;
-use crate::db::dbformat::LookupKey;
 use crate::db::dbformat::SequenceNumber;
-use crate::db::dbformat::TableKey;
+use crate::db::skiplist::Size;
+use std::sync::Arc;
 
-pub(super) struct MemtableKey {
+pub(super) struct InternalKey {
     user_key: Vec<u8>,
     sequence: SequenceNumber,
     value_type: ValueType,
     value: Vec<u8>,
 }
 
-impl MemtableKey {
+impl InternalKey {
     pub fn new(
         user_key: &[u8],
         sequence: SequenceNumber,
         value_type: ValueType,
         value: &[u8],
     ) -> Self {
-        MemtableKey {
+        InternalKey {
             user_key: user_key.to_vec(),
             sequence,
             value_type,
@@ -49,9 +47,9 @@ impl MemtableKey {
     }
 }
 
-impl Clone for MemtableKey {
+impl Clone for InternalKey {
     fn clone(&self) -> Self {
-        MemtableKey {
+        InternalKey {
             user_key: self.user_key.clone(),
             sequence: self.sequence,
             value_type: self.value_type,
@@ -60,7 +58,7 @@ impl Clone for MemtableKey {
     }
 }
 
-impl Ord for MemtableKey {
+impl Ord for InternalKey {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         //    increasing user key (according to user-supplied comparator)
         //    decreasing sequence number
@@ -75,13 +73,13 @@ impl Ord for MemtableKey {
     }
 }
 
-impl PartialOrd for MemtableKey {
+impl PartialOrd for InternalKey {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl PartialEq for MemtableKey {
+impl PartialEq for InternalKey {
     fn eq(&self, other: &Self) -> bool {
         self.user_key == other.user_key
             && self.sequence == other.sequence
@@ -89,11 +87,11 @@ impl PartialEq for MemtableKey {
     }
 }
 
-impl Eq for MemtableKey {}
+impl Eq for InternalKey {}
 
-impl Default for MemtableKey {
+impl Default for InternalKey {
     fn default() -> Self {
-        MemtableKey {
+        InternalKey {
             user_key: vec![],
             sequence: 0,
             value_type: ValueType::TypeValue,
@@ -102,24 +100,42 @@ impl Default for MemtableKey {
     }
 }
 
-impl Key for MemtableKey {}
+impl Key for InternalKey {}
+impl Size for InternalKey {
+    fn size(&self) -> usize {
+        // user_key + sequence + value_type + value
+        self.user_key.len() + 8 + 1 + self.value.len()
+    }
+}
 
-type Table = SkipList<MemtableKey>;
+pub(super) trait InternalIterator {
+    fn seek(&mut self, key: &InternalKey);
+    fn seek_to_first(&mut self);
+    fn seek_to_last(&mut self);
+    fn valid(&self) -> bool;
+    fn key(&self) -> Option<&InternalKey>;
+    fn next(&mut self);
+    fn prev(&mut self);
+}
+
+type Table = SkipList<InternalKey>;
+type TableIter = SkipListIter<InternalKey>;
+
 pub(super) struct MemTable {
-    table: Table,
+    table: Arc<Table>,
 }
 
 impl MemTable {
     pub fn new() -> Self {
         MemTable {
-            table: SkipList::new(),
+            table: Arc::new(SkipList::new()),
         }
     }
 
     // 返回 None 表示没找到，NotFound 错误表示删除了
     pub fn get(&self, user_key: &[u8], s: SequenceNumber) -> Result<Option<Vec<u8>>, DBError> {
-        let key = MemtableKey::new(user_key, s, VALUE_TYPE_FOR_SEEK, &[]);
-        let mut iter = self.table.iter();
+        let key = InternalKey::new(user_key, s, VALUE_TYPE_FOR_SEEK, &[]);
+        let mut iter = MemTableIter::new(self);
         iter.seek(&key);
         if iter.valid() {
             let entry = iter.key().unwrap();
@@ -144,52 +160,64 @@ impl MemTable {
     }
 
     pub fn add(&mut self, s: SequenceNumber, t: ValueType, user_key: &[u8], value: &[u8]) {
-        let key = MemtableKey::new(user_key, s, t, value);
-        self.table.insert(&key);
-    }
-
-    pub fn iter(&self) -> MemTableIter<'_> {
-        MemTableIter::new(self)
-    }
-}
-
-pub(super) struct MemTableIter<'a> {
-    inner: SkipListIter<'a, MemtableKey>,
-}
-
-impl<'a> MemTableIter<'a> {
-    pub fn new(memtable: &'a MemTable) -> Self {
-        MemTableIter {
-            inner: memtable.table.iter(),
+        let key = InternalKey::new(user_key, s, t, value);
+        let table = Arc::as_ptr(&self.table.clone()) as *mut Table;
+        unsafe {
+            (*table).insert(&key);
         }
     }
-    pub fn seek_to_first(&mut self) {
-        self.inner.seek_to_first();
+
+    pub fn aproximate_size(&self) -> usize {
+        self.table.approximate_size()
     }
-    pub fn seek_to_last(&mut self) {
-        self.inner.seek_to_last();
+}
+
+pub(super) struct MemTableIter {
+    iter: TableIter,
+}
+
+impl MemTableIter {
+    pub fn new(mem: &MemTable) -> Self {
+        MemTableIter {
+            iter: TableIter::new(mem.table.clone()),
+        }
     }
-    pub fn seek(&mut self, user_key: &[u8], sequence: SequenceNumber, value_type: ValueType) {
-        let lookup_key = MemtableKey::new(user_key, sequence, value_type, &[]);
-        self.inner.seek(&lookup_key);
-    }
-    pub fn valid(&self) -> bool {
-        self.inner.valid()
-    }
-    pub fn key(&self) -> Option<&'a MemtableKey> {
-        self.inner.key()
+}
+
+impl InternalIterator for MemTableIter {
+    fn seek(&mut self, key: &InternalKey) {
+        self.iter.seek(key);
     }
 
-    pub fn next(&mut self) {
-        self.inner.next();
+    fn seek_to_first(&mut self) {
+        self.iter.seek_to_first();
     }
-    pub fn prev(&mut self) {
-        self.inner.prev();
+
+    fn seek_to_last(&mut self) {
+        self.iter.seek_to_last();
+    }
+
+    fn valid(&self) -> bool {
+        self.iter.valid()
+    }
+
+    fn key(&self) -> Option<&InternalKey> {
+        self.iter.key()
+    }
+
+    fn next(&mut self) {
+        self.iter.next();
+    }
+
+    fn prev(&mut self) {
+        self.iter.prev();
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::db::dbformat::MAX_SEQUENCE_NUMBER;
+
     use super::*;
 
     #[test]
@@ -215,7 +243,7 @@ mod tests {
             .collect();
         expected.sort_by(|a, b| a.0.cmp(&b.0));
         // 正序遍历
-        let mut iter = mem.iter();
+        let mut iter = MemTableIter::new(&mem);
         iter.seek_to_first();
         let mut results = vec![];
         while iter.valid() {
@@ -249,7 +277,7 @@ mod tests {
         }
 
         // 逆序遍历测试
-        let mut iter = mem.iter();
+        let mut iter = MemTableIter::new(&mem);
         iter.seek_to_last();
         let mut rev_results = vec![];
         while iter.valid() {
@@ -272,7 +300,7 @@ mod tests {
         }
 
         // 随机 seek 测试（包含边界和不存在的 key）
-        let mut iter = mem.iter();
+        let mut iter = MemTableIter::new(&mem);
         let seek_cases: Vec<(&[u8], Option<&[u8]>)> = vec![
             (b"cat" as &[u8], Some(b"cat" as &[u8])), // 精确命中
             (b"banana", Some(b"banana")),             // 精确命中
@@ -286,7 +314,8 @@ mod tests {
             (b"0", Some(b"a")),                       // 小于所有 key，lower_bound
         ];
         for (seek_key, expect_key) in seek_cases.iter() {
-            iter.seek(seek_key, u64::MAX, ValueType::TypeValue);
+            let key = InternalKey::new(&seek_key, MAX_SEQUENCE_NUMBER, ValueType::TypeValue, &[]);
+            iter.seek(&key);
             if let Some(expect) = expect_key {
                 assert!(
                     iter.valid(),

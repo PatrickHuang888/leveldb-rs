@@ -1,8 +1,8 @@
 use crate::db::{
-    dbformat::{DBError, SequenceNumber, VALUE_TYPE_FOR_SEEK, ValueType},
-    memtable::{MemTable, MemTableIter},
+    dbformat::{DBError, SequenceNumber, ValueType},
+    memtable::{InternalIterator, InternalKey, MemTable, MemTableIter},
 };
-use std::{sync::Arc, sync::Mutex};
+use std::{cell::RefCell, rc::Rc, sync::Arc, sync::Mutex};
 use tokio::sync::{mpsc, oneshot};
 
 struct WriteOptions {
@@ -37,9 +37,14 @@ struct WriteMsg {
 }
 
 struct DB {
-    mem: Arc<MemTable>,
+    inner: Arc<Mutex<DBInner>>,
     tx: mpsc::Sender<WriteMsg>,
     last_sequence: Arc<Mutex<SequenceNumber>>,
+}
+
+struct DBInner {
+    mem: Arc<MemTable>,
+    _imm: Option<Arc<MemTable>>,
 }
 
 impl DB {
@@ -47,14 +52,23 @@ impl DB {
         let rt = tokio::runtime::Runtime::new()?;
         let mem = Arc::new(MemTable::new());
         let (tx, mut rx) = mpsc::channel::<WriteMsg>(CHANNEL_MAX_SIZE);
-        let mem_clone = mem.clone();
 
         let last_sequence = Arc::new(Mutex::new(0u64));
         let snapshot = Arc::clone(&last_sequence);
 
+        let inner = Arc::new(Mutex::new(DBInner { mem, _imm: None }));
+        let inner_clone = Arc::clone(&inner);
+
+        let db = DB {
+            inner,
+            tx,
+            last_sequence: Arc::clone(&last_sequence),
+        };
+
         std::thread::spawn(move || {
             rt.block_on(async move {
                 let mut queue = Vec::new();
+                let mem_clone = Arc::clone(&inner_clone.lock().unwrap().mem);
                 let mem_ptr = Arc::as_ptr(&mem_clone) as *mut MemTable;
                 loop {
                     tokio::select! {
@@ -91,11 +105,7 @@ impl DB {
                 }
             });
         });
-        Ok(DB {
-            mem,
-            tx,
-            last_sequence,
-        })
+        Ok(db)
     }
 
     pub async fn write(
@@ -137,29 +147,33 @@ impl DB {
             *last_seq
         };
 
-        self.mem.get(key, snapshot)
-    }
-
-    pub fn iter(&self) -> DBIterator {
-        let snapshot = {
-            let last_seq = self.last_sequence.lock().unwrap();
-            *last_seq
+        let (mem, _imm) = {
+            let inner = self.inner.lock().unwrap();
+            (Arc::clone(&inner.mem), inner._imm.clone())
         };
-        let iter = self.mem.iter();
-        DBIterator {
-            snapshot,
-            iter,
-            valid: false,
-            saved_user_key: Vec::new(),
-            saved_value: Vec::new(),
-            direction: Direction::Forward,
+        let try_get = |table: &Arc<MemTable>| table.get(key, snapshot);
+
+        match try_get(&mem) {
+            Ok(Some(value)) => Ok(Some(value)),
+            Ok(None) => {
+                if let Some(imm) = _imm {
+                    match try_get(&imm) {
+                        Ok(Some(value)) => Ok(Some(value)),
+                        Ok(None) => Ok(None), // TODO: 查找 SSTable
+                        Err(e) => Err(e),
+                    }
+                } else {
+                    Ok(None) // TODO: 查找 SSTable
+                }
+            }
+            Err(e) => Err(e),
         }
     }
 }
 
-pub struct DBIterator<'a> {
+pub struct DBIterator {
     snapshot: SequenceNumber,
-    iter: MemTableIter<'a>,
+    iter: MergeIterator,
     valid: bool,
     saved_user_key: Vec<u8>,
     saved_value: Vec<u8>,
@@ -172,7 +186,22 @@ enum Direction {
     Reverse,
 }
 
-impl DBIterator<'_> {
+impl DBIterator {
+    pub fn new(
+        iterators: Vec<Rc<RefCell<dyn InternalIterator>>>,
+        snapshot: SequenceNumber,
+    ) -> Self {
+        let iter = MergeIterator::new(iterators);
+        DBIterator {
+            snapshot,
+            iter,
+            valid: false,
+            saved_user_key: Vec::new(),
+            saved_value: Vec::new(),
+            direction: Direction::Forward,
+        }
+    }
+
     // Helper method to find the next valid key visible to the user
     fn find_next_valid_key(&mut self, mut skipping: bool) {
         //assert!(self.valid());
@@ -279,8 +308,8 @@ impl DBIterator<'_> {
         self.saved_value.clear();
         self.saved_user_key.clear();
         self.saved_user_key.extend_from_slice(user_key);
-        self.iter
-            .seek(&self.saved_user_key, self.snapshot, VALUE_TYPE_FOR_SEEK);
+        let ikey = InternalKey::new(user_key, self.snapshot, ValueType::TypeValue, &[]);
+        self.iter.seek(&ikey);
         if self.iter.valid() {
             self.find_next_valid_key(false);
         } else {
@@ -290,7 +319,7 @@ impl DBIterator<'_> {
     }
 
     pub fn next(&mut self) {
-        assert!(self.valid);
+        //assert!(self.valid);
 
         if self.direction == Direction::Reverse {
             // If we were going backwards, switch to forward direction
@@ -366,25 +395,179 @@ impl DBIterator<'_> {
         self.valid
     }
 
-    pub fn key(&self) -> Option<&[u8]> {
+    pub fn key(&self) -> Option<Vec<u8>> {
         if self.direction == Direction::Forward {
-            self.iter.key().map(|k| k.user_key())
+            self.iter.key().map(|k| k.user_key().to_vec())
         } else {
-            Some(&self.saved_user_key[..])
+            Some(self.saved_user_key.clone())
         }
     }
 
-    pub fn value(&self) -> Option<&[u8]> {
+    pub fn value(&self) -> Option<Vec<u8>> {
         if self.direction == Direction::Forward {
-            self.iter.key().map(|k| k.value())
+            self.iter.key().map(|k| k.value().to_vec())
         } else {
-            Some(&self.saved_value[..])
+            Some(self.saved_value.clone())
         }
+    }
+}
+
+struct MergeIterator {
+    iterators: Vec<Rc<RefCell<dyn InternalIterator>>>,
+    current: Option<Rc<RefCell<dyn InternalIterator>>>,
+    direction: Direction,
+}
+
+impl MergeIterator {
+    pub fn new(iterators: Vec<Rc<RefCell<dyn InternalIterator>>>) -> Self {
+        MergeIterator {
+            iterators,
+            current: None,
+            direction: Direction::Forward,
+        }
+    }
+
+    pub fn valid(&self) -> bool {
+        self.current.is_some()
+    }
+
+    pub fn seek_to_first(&mut self) {
+        for iter in &self.iterators {
+            iter.borrow_mut().seek_to_first();
+        }
+        self.find_smallest();
+        self.direction = Direction::Forward;
+    }
+
+    fn find_smallest(&mut self) {
+        let mut smallest: Option<Rc<RefCell<dyn InternalIterator>>> = None;
+        for iter in &self.iterators {
+            let iter_borrow = iter.borrow();
+            if let Some(key) = iter_borrow.key() {
+                let is_smaller = match &smallest {
+                    None => true,
+                    Some(smallest_iter) => {
+                        let smallest_borrow = smallest_iter.borrow();
+                        if let Some(smallest_key) = smallest_borrow.key() {
+                            key < smallest_key
+                        } else {
+                            false
+                        }
+                    }
+                };
+                if is_smaller {
+                    smallest = Some(iter.clone());
+                }
+            }
+        }
+        self.current = smallest;
+    }
+
+    pub fn seek_to_last(&mut self) {
+        for iter in &self.iterators {
+            iter.borrow_mut().seek_to_last();
+        }
+        self.find_largest();
+        self.direction = Direction::Reverse;
+    }
+
+    fn find_largest(&mut self) {
+        let mut largest: Option<Rc<RefCell<dyn InternalIterator>>> = None;
+        for iter in &self.iterators {
+            let iter_borrow = iter.borrow();
+            if let Some(key) = iter_borrow.key() {
+                let is_larger = match &largest {
+                    None => true,
+                    Some(largest_iter) => {
+                        let largest_borrow = largest_iter.borrow();
+                        if let Some(largest_key) = largest_borrow.key() {
+                            key > largest_key
+                        } else {
+                            false
+                        }
+                    }
+                };
+                if is_larger {
+                    largest = Some(iter.clone());
+                }
+            }
+        }
+        self.current = largest;
+    }
+
+    pub fn seek(&mut self, key: &InternalKey) {
+        self.direction = Direction::Forward;
+        for iter in &mut self.iterators {
+            iter.borrow_mut().seek(key);
+        }
+        self.find_smallest();
+    }
+
+    pub fn key(&self) -> Option<InternalKey> {
+        self.current.as_ref().and_then(|iter| {
+            let iter_borrow = iter.borrow();
+            iter_borrow.key().cloned()
+        })
+    }
+
+    pub fn next(&mut self) {
+        if self.direction != Direction::Forward {
+            // Ensure that all children are positioned after key()
+            if let Some(current) = &self.current {
+                let key = self.key();
+                for iter in &mut self.iterators {
+                    if !Rc::ptr_eq(iter, current) {
+                        if let Some(ref k) = key {
+                            iter.borrow_mut().seek(k);
+                        }
+                        if iter.borrow().valid() && (key == iter.borrow().key().cloned()) {
+                            iter.borrow_mut().next();
+                        }
+                    }
+                }
+            }
+            self.direction = Direction::Forward;
+        }
+
+        if let Some(current) = &self.current {
+            current.borrow_mut().next();
+        }
+        self.find_smallest();
+    }
+
+    pub fn prev(&mut self) {
+        if self.direction != Direction::Reverse {
+            // Ensure that all children are positioned before key()
+            if let Some(current) = &self.current {
+                let key = self.key();
+                for iter in &mut self.iterators {
+                    if !Rc::ptr_eq(iter, current) {
+                        if let Some(ref k) = key {
+                            iter.borrow_mut().seek(k);
+                        }
+                        if iter.borrow().valid() {
+                            iter.borrow_mut().prev();
+                        } else {
+                            // has no entries >= key().  Position at last entry.
+                            iter.borrow_mut().seek_to_last();
+                        }
+                    }
+                }
+            }
+            self.direction = Direction::Reverse;
+        }
+
+        if let Some(current) = &self.current {
+            current.borrow_mut().prev();
+        }
+        self.find_largest();
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::db::dbformat::MAX_SEQUENCE_NUMBER;
+
     use super::*;
     use tokio::runtime::Runtime;
 
@@ -443,7 +626,11 @@ mod tests {
         });
 
         // 正向遍历
-        let mut iter = db.iter();
+        let mem = Arc::clone(&db.inner.lock().unwrap().mem);
+        let mut iter = DBIterator::new(
+            vec![Rc::new(RefCell::new(MemTableIter::new(&mem)))],
+            MAX_SEQUENCE_NUMBER, // 使用当前的 sequence number
+        );
         iter.seek_to_first();
         let mut keys = Vec::new();
         let mut values = Vec::new();
@@ -456,7 +643,10 @@ mod tests {
         assert_eq!(values, vec![b"1".to_vec(), b"2".to_vec(), b"3".to_vec()]);
 
         // 反向遍历
-        let mut iter = db.iter();
+        let mut iter = DBIterator::new(
+            vec![Rc::new(RefCell::new(MemTableIter::new(&mem)))],
+            MAX_SEQUENCE_NUMBER, // 使用当前的 sequence number
+        );
         iter.seek_to_last();
         let mut rev_keys = Vec::new();
         let mut rev_values = Vec::new();
@@ -471,7 +661,10 @@ mod tests {
         );
 
         // seek 到 b
-        let mut iter = db.iter();
+        let mut iter = DBIterator::new(
+            vec![Rc::new(RefCell::new(MemTableIter::new(&mem)))],
+            MAX_SEQUENCE_NUMBER, // 使用当前的 sequence number
+        );
         iter.seek(b"b");
         assert!(iter.valid());
         assert_eq!(iter.key().unwrap(), b"b");

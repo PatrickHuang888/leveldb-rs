@@ -3,7 +3,7 @@ use crate::db::{
     memtable::{InternalIterator, InternalKey, MemTable, MemTableIter},
 };
 use std::{cell::RefCell, rc::Rc, sync::Arc, sync::Mutex};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Notify, mpsc, oneshot};
 
 struct WriteOptions {
     sync: bool,
@@ -40,6 +40,7 @@ struct DB {
     inner: Arc<Mutex<DBInner>>,
     tx: mpsc::Sender<WriteMsg>,
     last_sequence: Arc<Mutex<SequenceNumber>>,
+    compacting_notify: Arc<Notify>,
 }
 
 struct DBInner {
@@ -49,7 +50,6 @@ struct DBInner {
 
 impl DB {
     fn new() -> Result<Self, DBError> {
-        let rt = tokio::runtime::Runtime::new()?;
         let mem = Arc::new(MemTable::new());
         let (tx, mut rx) = mpsc::channel::<WriteMsg>(CHANNEL_MAX_SIZE);
 
@@ -63,12 +63,44 @@ impl DB {
             inner,
             tx,
             last_sequence: Arc::clone(&last_sequence),
+            compacting_notify: Arc::new(Notify::new()),
         };
 
+        let notify_notifier = Arc::clone(&db.compacting_notify);
+        let notify_waiting = Arc::clone(&db.compacting_notify);
+
         std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async move {
+                loop {
+                    notify_waiting.notified().await;
+                    // 这里可以添加 compaction 或 flush 的逻辑
+                    // 例如，检查 _imm 是否存在，如果存在则进行合并或持久化
+                }
+            });
+        });
+
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(async move {
                 let mut queue = Vec::new();
-                let mem_clone = Arc::clone(&inner_clone.lock().unwrap().mem);
+
+                let mem_clone = {
+                    let mut guard = inner_clone.lock().unwrap();
+
+                    // make room for write
+                    if guard.mem.aproximate_size() > 100_000 {
+                        if guard._imm.is_none() {
+                            guard._imm = Some(Arc::clone(&guard.mem));
+                            guard.mem = Arc::new(MemTable::new());
+                        }
+                        // notify compaction or flush
+                        // 也许 compaction 正忙?仍然发消息?
+                        notify_notifier.notify_one();
+                    }
+                    Arc::clone(&guard.mem)
+                };
+
                 let mem_ptr = Arc::as_ptr(&mem_clone) as *mut MemTable;
                 loop {
                     tokio::select! {

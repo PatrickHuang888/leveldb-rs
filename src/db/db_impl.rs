@@ -710,4 +710,68 @@ mod tests {
         assert!(iter.valid());
         assert_eq!(iter.key().unwrap(), b"b");
     }
+
+    #[test]
+    fn test_merge_iterator_multiple_memtables() {
+        // 构造两个 memtable，key 有重叠
+        let mut mem1 = MemTable::new();
+        let mut mem2 = MemTable::new();
+        // mem1: a->1, b->2, c->3
+        mem1.add(1, ValueType::TypeValue, b"a", b"1");
+        mem1.add(2, ValueType::TypeValue, b"b", b"2");
+        mem1.add(3, ValueType::TypeValue, b"c", b"3");
+        // mem2: b->20, c->30, d->40
+        mem2.add(4, ValueType::TypeValue, b"b", b"20");
+        mem2.add(5, ValueType::TypeValue, b"c", b"30");
+        mem2.add(6, ValueType::TypeValue, b"d", b"40");
+        // 包裹 Arc
+        let mem1 = Arc::new(mem1);
+        let mem2 = Arc::new(mem2);
+        // 构造 MergeIterator
+        let iter1 = Rc::new(RefCell::new(MemTableIter::new(&mem1)));
+        let iter2 = Rc::new(RefCell::new(MemTableIter::new(&mem2)));
+        let mut merge_iter = MergeIterator::new(vec![iter1, iter2]);
+        // 正向遍历
+        merge_iter.seek_to_first();
+        let mut keys = Vec::new();
+        let mut values = Vec::new();
+        while merge_iter.valid() {
+            if let Some(key) = merge_iter.key() {
+                keys.push(key.user_key().to_vec());
+                values.push(key.value().to_vec());
+            }
+            merge_iter.next();
+        }
+        // 打印 values 作为字符串
+        let value_strs: Vec<String> = values
+            .iter()
+            .map(|v| String::from_utf8_lossy(v).to_string())
+            .collect();
+        println!("values as string = {:?}", value_strs);
+
+        // 不会去重
+        assert_eq!(
+            keys,
+            vec![
+                b"a".to_vec(),
+                b"b".to_vec(),
+                b"b".to_vec(),
+                b"c".to_vec(),
+                b"c".to_vec(),
+                b"d".to_vec()
+            ]
+        );
+        // 版本逆序
+        assert_eq!(
+            values,
+            vec![
+                b"1".to_vec(),
+                b"20".to_vec(),
+                b"2".to_vec(),
+                b"30".to_vec(),
+                b"3".to_vec(),
+                b"40".to_vec()
+            ]
+        );
+    }
 }

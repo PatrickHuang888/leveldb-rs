@@ -11,6 +11,7 @@ struct WriteOptions {
 
 const CHANNEL_MAX_SIZE: usize = 10_000;
 const BATCH_COMBINE_THRESHOLD: usize = 100;
+const COMPACTION_MEMORY_THRESHOLD: usize = 100_000;
 
 struct WriteBatch {
     writes: Vec<(Vec<u8>, Vec<u8>, ValueType)>, // (key, value, value_type)
@@ -57,7 +58,8 @@ impl DB {
         let snapshot = Arc::clone(&last_sequence);
 
         let inner = Arc::new(Mutex::new(DBInner { mem, _imm: None }));
-        let inner_clone = Arc::clone(&inner);
+        let inner_write = Arc::clone(&inner);
+        let inner_compaction = Arc::clone(&inner);
 
         let db = DB {
             inner,
@@ -76,6 +78,12 @@ impl DB {
                     notify_waiting.notified().await;
                     // 这里可以添加 compaction 或 flush 的逻辑
                     // 例如，检查 _imm 是否存在，如果存在则进行合并或持久化
+                    println!("Compaction signal received");
+                    let guard = inner_compaction.lock().unwrap();
+                    if guard._imm.is_some() {
+                        // 进行合并或持久化
+                        println!("imm still in compaction, waiting...\n");
+                    }
                 }
             });
         });
@@ -85,24 +93,26 @@ impl DB {
             rt.block_on(async move {
                 let mut queue = Vec::new();
 
-                let mem_clone = {
-                    let mut guard = inner_clone.lock().unwrap();
-
-                    // make room for write
-                    if guard.mem.aproximate_size() > 100_000 {
-                        if guard._imm.is_none() {
-                            guard._imm = Some(Arc::clone(&guard.mem));
-                            guard.mem = Arc::new(MemTable::new());
-                        }
-                        // notify compaction or flush
-                        // 也许 compaction 正忙?仍然发消息?
-                        notify_notifier.notify_one();
-                    }
-                    Arc::clone(&guard.mem)
-                };
-
-                let mem_ptr = Arc::as_ptr(&mem_clone) as *mut MemTable;
                 loop {
+                    let mem_clone = {
+                        let mut guard = inner_write.lock().unwrap();
+
+                        // make room for write
+                        dbg!(guard.mem.aproximate_size());
+                        if guard.mem.aproximate_size() > COMPACTION_MEMORY_THRESHOLD {
+                            dbg!("Compaction triggered, moving memtable to _imm");
+                            if guard._imm.is_none() {
+                                guard._imm = Some(Arc::clone(&guard.mem));
+                                guard.mem = Arc::new(MemTable::new());
+                            }
+                            // notify compaction or flush
+                            // 也许 compaction 正忙?仍然发消息?
+                            notify_notifier.notify_one();
+                        }
+                        Arc::clone(&guard.mem)
+                    };
+                    let mem_ptr = Arc::as_ptr(&mem_clone) as *mut MemTable;
+
                     tokio::select! {
                         biased;
                         msg = rx.recv() => {
@@ -116,6 +126,7 @@ impl DB {
                                     }
                                 }
                                 // 一次性处理 queue 里的所有 WriteBatch
+                                dbg!(queue.len());
                                 for msg in queue.drain(..) {
                                     for (key, value, value_type) in msg.batch.writes {
                                         let seq = {
@@ -773,5 +784,123 @@ mod tests {
                 b"40".to_vec()
             ]
         );
+    }
+
+    #[test]
+    fn test_db_write_batch_threshold_concurrent() {
+        use futures::future::join_all;
+        use std::thread;
+        use std::time::Duration;
+        use tokio::runtime::Runtime;
+
+        let rt = Runtime::new().unwrap();
+        let db = Arc::new(DB::new().unwrap());
+
+        let total = BATCH_COMBINE_THRESHOLD * 3 + 7;
+        let concurrency = 150;
+
+        rt.block_on(async {
+            let mut tasks = Vec::new();
+            for t in 0..concurrency {
+                let db = db.clone();
+                let start = t * (total / concurrency);
+                let end = if t == concurrency - 1 {
+                    total
+                } else {
+                    (t + 1) * (total / concurrency)
+                };
+                tasks.push(tokio::spawn(async move {
+                    for i in start..end {
+                        let mut batch = WriteBatch::new();
+                        batch.put(format!("k{}", i).as_bytes(), format!("v{}", i).as_bytes());
+                        db.write(WriteOptions { sync: false }, Some(batch))
+                            .await
+                            .unwrap();
+                    }
+                }));
+            }
+            join_all(tasks).await;
+        });
+
+        // 等待后台线程处理
+        thread::sleep(Duration::from_millis(200));
+
+        // 检查部分 key 是否写入成功
+        assert_eq!(db.get(b"k0").unwrap(), Some(b"v0".to_vec()));
+        assert_eq!(
+            db.get(format!("k{}", total - 1).as_bytes()).unwrap(),
+            Some(format!("v{}", total - 1).as_bytes().to_vec())
+        );
+
+        // 你可以在 queue.drain(..) 处加 println!("drain batch, len={}", batch_len);
+        // 运行测试时应能看到多次批量处理（合并）。
+    }
+
+    #[test]
+    fn test_db_memtable_to_imm_compaction_trigger() {
+        use std::thread;
+        use std::time::Duration;
+        use tokio::runtime::Runtime;
+
+        let rt = Runtime::new().unwrap();
+        let db = DB::new().unwrap();
+
+        // 写入大量数据，超过 COMPACTION_THRESHOLD，触发 memtable -> imm
+        let value = vec![b'x'; 1024]; // 1KB value
+        let key_prefix = b"key_";
+        let batch_size = COMPACTION_MEMORY_THRESHOLD / 1024 + 10; // 保证超过阈值
+
+        rt.block_on(async {
+            let mut batch = WriteBatch::new();
+            for i in 0..batch_size {
+                let mut key = key_prefix.to_vec();
+                key.extend_from_slice(i.to_string().as_bytes());
+                batch.put(&key, &value);
+            }
+
+            db.write(WriteOptions { sync: false }, Some(batch))
+                .await
+                .unwrap();
+        });
+
+        // 等待后台线程处理 compaction
+        thread::sleep(Duration::from_millis(200));
+
+        {
+            // 检查 imm 是否被正确生成
+            let inner = db.inner.lock().unwrap();
+            assert!(
+                inner._imm.is_some(),
+                "imm should be Some after compaction triggered"
+            );
+        }
+
+        // 再写入一条数据，应该写到新的 memtable
+        rt.block_on(async {
+            let mut batch = WriteBatch::new();
+            batch.put(b"last_key", b"last_value");
+            db.write(WriteOptions { sync: false }, Some(batch))
+                .await
+                .unwrap();
+        });
+
+        // 检查 get 能查到新旧数据
+        assert_eq!(db.get(b"last_key").unwrap(), Some(b"last_value".to_vec()));
+        let mut found = false;
+        for i in 0..batch_size {
+            let mut key = key_prefix.to_vec();
+            key.extend_from_slice(i.to_string().as_bytes());
+            if db.get(&key).unwrap().is_some() {
+                found = true;
+                break;
+            }
+        }
+        assert!(found, "Should find at least one old key in mem or imm");
+
+        // 可以打印 imm 的 approximate_size 观察
+        let inner = db.inner.lock().unwrap();
+        if let Some(ref imm) = inner._imm {
+            println!("imm approximate_size = {}", imm.aproximate_size());
+        }
     }
 }

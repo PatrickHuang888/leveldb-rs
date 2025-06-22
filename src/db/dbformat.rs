@@ -1,38 +1,4 @@
-#[derive(Debug)]
-pub enum DBError {
-    NotFound,
-    NotSupported,
-    Corruption,
-    IoError(std::io::Error),
-}
-
-impl From<std::io::Error> for DBError {
-    fn from(e: std::io::Error) -> Self {
-        DBError::IoError(e)
-    }
-}
-
-impl std::fmt::Display for DBError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            DBError::NotFound => write!(f, "Not found"),
-            DBError::NotSupported => write!(f, "Not supported"),
-            DBError::Corruption => write!(f, "Corruption"),
-            DBError::IoError(e) => write!(f, "IO error: {}", e),
-        }
-    }
-}
-
-impl Clone for DBError {
-    fn clone(&self) -> Self {
-        match self {
-            DBError::NotFound => DBError::NotFound,
-            DBError::NotSupported => DBError::NotSupported,
-            DBError::Corruption => DBError::Corruption,
-            DBError::IoError(e) => DBError::IoError(std::io::Error::new(e.kind(), e.to_string())),
-        }
-    }
-}
+use crate::util;
 
 #[derive(Ord, PartialOrd, Eq, PartialEq, Copy, Clone, Debug)]
 pub enum ValueType {
@@ -63,7 +29,7 @@ impl LookupKey {
     }
 
     pub fn decode(buf: &[u8]) -> Option<Self> {
-        let (key_len, offset) = decode_varint32(buf)?;
+        let (key_len, offset) = util::decode_varint32(buf)?;
         let user_key = buf[offset..offset + key_len as usize].to_vec();
         let tag_offset = offset + key_len as usize;
         let tag_bytes = &buf[tag_offset..tag_offset + 8];
@@ -85,7 +51,7 @@ impl LookupKey {
     pub fn encode(&self, buf: &mut Vec<u8>) {
         buf.clear();
         let key_len = self.user_key.len() + 8;
-        encode_varint32(buf, key_len as u32);
+        util::encode_varint32(buf, key_len as u32);
         buf.extend_from_slice(&self.user_key);
         let packed = (self.sequence << 8) | (self.value_type as u64);
         buf.extend_from_slice(&packed.to_le_bytes());
@@ -121,10 +87,10 @@ impl TableKey {
     }
 
     pub fn decode(buf: &[u8]) -> Option<Self> {
-        let (key_len, offset) = decode_varint32(buf)?;
+        let (key_len, offset) = util::decode_varint32(buf)?;
         let key_start = offset;
         let value_start = key_start + key_len as usize + 8; // 8 bytes for tag
-        let (value_len, offset) = decode_varint32(&buf[value_start..])?;
+        let (value_len, offset) = util::decode_varint32(&buf[value_start..])?;
         let value_offset = value_start + offset;
         let value = buf[value_offset..value_offset + value_len as usize].to_vec();
 
@@ -140,12 +106,12 @@ impl TableKey {
     pub fn encode(&self, buf: &mut Vec<u8>) {
         buf.clear();
         let key = self.lookup_key.get_user_key();
-        encode_varint32(buf, key.len() as u32);
+        util::encode_varint32(buf, key.len() as u32);
         buf.extend_from_slice(key);
         let tag = (self.lookup_key.get_sequence_number() << 8)
             | (self.lookup_key.get_value_type() as u64);
         buf.extend_from_slice(&tag.to_le_bytes());
-        encode_varint32(buf, self.value.len() as u32);
+        util::encode_varint32(buf, self.value.len() as u32);
         buf.extend_from_slice(&self.value);
     }
 

@@ -1,9 +1,9 @@
-use super::dbformat::DBError;
 use super::dbformat::VALUE_TYPE_FOR_SEEK;
 use super::dbformat::ValueType;
 use super::skiplist::Key;
 use super::skiplist::SkipList;
 use super::skiplist::SkipListIter;
+use crate::DBError;
 use crate::db::dbformat::SequenceNumber;
 use crate::db::skiplist::Size;
 use std::sync::Arc;

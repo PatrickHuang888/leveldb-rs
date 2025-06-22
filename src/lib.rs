@@ -23,3 +23,39 @@ impl Default for Options {
         }
     }
 }
+
+#[derive(Debug)]
+pub enum DBError {
+    NotFound,
+    NotSupported,
+    Corruption,
+    IoError(std::io::Error),
+}
+
+impl From<std::io::Error> for DBError {
+    fn from(e: std::io::Error) -> Self {
+        DBError::IoError(e)
+    }
+}
+
+impl std::fmt::Display for DBError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DBError::NotFound => write!(f, "Not found"),
+            DBError::NotSupported => write!(f, "Not supported"),
+            DBError::Corruption => write!(f, "Corruption"),
+            DBError::IoError(e) => write!(f, "IO error: {}", e),
+        }
+    }
+}
+
+impl Clone for DBError {
+    fn clone(&self) -> Self {
+        match self {
+            DBError::NotFound => DBError::NotFound,
+            DBError::NotSupported => DBError::NotSupported,
+            DBError::Corruption => DBError::Corruption,
+            DBError::IoError(e) => DBError::IoError(std::io::Error::new(e.kind(), e.to_string())),
+        }
+    }
+}

@@ -21,3 +21,25 @@ pub(super) fn encode_varint32(buf: &mut Vec<u8>, mut v: u32) {
     }
     buf.push(v as u8);
 }
+
+pub(super) fn encode_fixed32(buf: &mut Vec<u8>, v: u32) {
+    buf.extend_from_slice(&v.to_le_bytes());
+}
+pub(super) fn encode_fixed64(buf: &mut Vec<u8>, v: u64) {
+    buf.extend_from_slice(&v.to_le_bytes());
+}
+pub(super) fn decode_fixed32(buf: &[u8]) -> Option<u32> {
+    if buf.len() < 4 {
+        return None; // 缓冲区不足
+    }
+    let value = u32::from_le_bytes(buf[0..4].try_into().ok()?);
+    Some(value)
+}
+
+pub(super) fn decode_fixed64(buf: &[u8]) -> Option<u64> {
+    if buf.len() < 8 {
+        return None; // 缓冲区不足
+    }
+    let value = u64::from_le_bytes(buf[0..8].try_into().ok()?);
+    Some(value)
+}

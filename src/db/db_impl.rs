@@ -1,5 +1,6 @@
+use crate::DBError;
 use crate::db::{
-    dbformat::{DBError, SequenceNumber, ValueType},
+    dbformat::{SequenceNumber, ValueType},
     memtable::{InternalIterator, InternalKey, MemTable, MemTableIter},
 };
 use std::{cell::RefCell, rc::Rc, sync::Arc, sync::Mutex};

@@ -1,7 +1,9 @@
+use super::InternalIterator;
+use super::InternalKey;
 use crate::DBError;
 use crate::db::{
     dbformat::{SequenceNumber, ValueType},
-    memtable::{InternalIterator, InternalKey, MemTable, MemTableIter},
+    memtable::{MemTable, MemTableIter},
 };
 use std::{cell::RefCell, rc::Rc, sync::Arc, sync::Mutex};
 use tokio::sync::{Notify, mpsc, oneshot};

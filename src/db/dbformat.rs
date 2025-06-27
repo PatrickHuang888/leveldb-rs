@@ -15,6 +15,7 @@ pub struct LookupKey {
 }
 
 pub(super) type SequenceNumber = u64;
+
 // We leave eight bits empty at the bottom so a type and sequence#
 // can be packed together into 64-bits.
 pub(super) const MAX_SEQUENCE_NUMBER: SequenceNumber = (1u64 << 56) - 1;

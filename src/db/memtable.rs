@@ -1,122 +1,17 @@
+use super::InternalIterator;
+use super::InternalKey;
 use super::dbformat::VALUE_TYPE_FOR_SEEK;
 use super::dbformat::ValueType;
 use super::skiplist::Key;
 use super::skiplist::SkipList;
 use super::skiplist::SkipListIter;
 use crate::DBError;
+use crate::db::dbformat::MAX_SEQUENCE_NUMBER;
 use crate::db::dbformat::SequenceNumber;
 use crate::db::skiplist::Size;
+use crate::util;
+use std::char::MAX;
 use std::sync::Arc;
-
-pub(super) struct InternalKey {
-    user_key: Vec<u8>,
-    sequence: SequenceNumber,
-    value_type: ValueType,
-    value: Vec<u8>,
-}
-
-impl InternalKey {
-    pub fn new(
-        user_key: &[u8],
-        sequence: SequenceNumber,
-        value_type: ValueType,
-        value: &[u8],
-    ) -> Self {
-        InternalKey {
-            user_key: user_key.to_vec(),
-            sequence,
-            value_type,
-            value: value.to_vec(),
-        }
-    }
-
-    pub fn user_key(&self) -> &[u8] {
-        &self.user_key
-    }
-
-    pub fn sequence(&self) -> SequenceNumber {
-        self.sequence
-    }
-
-    pub fn value_type(&self) -> ValueType {
-        self.value_type
-    }
-
-    pub fn value(&self) -> &[u8] {
-        &self.value
-    }
-}
-
-impl Clone for InternalKey {
-    fn clone(&self) -> Self {
-        InternalKey {
-            user_key: self.user_key.clone(),
-            sequence: self.sequence,
-            value_type: self.value_type,
-            value: self.value.clone(),
-        }
-    }
-}
-
-impl Ord for InternalKey {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        //    increasing user key (according to user-supplied comparator)
-        //    decreasing sequence number
-        //    decreasing type (though sequence# should be enough to disambiguate)
-        match self.user_key.cmp(&other.user_key) {
-            std::cmp::Ordering::Equal => match other.sequence.cmp(&self.sequence) {
-                std::cmp::Ordering::Equal => other.value_type.cmp(&self.value_type),
-                ord => ord,
-            },
-            ord => ord,
-        }
-    }
-}
-
-impl PartialOrd for InternalKey {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl PartialEq for InternalKey {
-    fn eq(&self, other: &Self) -> bool {
-        self.user_key == other.user_key
-            && self.sequence == other.sequence
-            && self.value_type == other.value_type
-    }
-}
-
-impl Eq for InternalKey {}
-
-impl Default for InternalKey {
-    fn default() -> Self {
-        InternalKey {
-            user_key: vec![],
-            sequence: 0,
-            value_type: ValueType::TypeValue,
-            value: vec![],
-        }
-    }
-}
-
-impl Key for InternalKey {}
-impl Size for InternalKey {
-    fn size(&self) -> usize {
-        // user_key + sequence + value_type + value
-        self.user_key.len() + 8 + 1 + self.value.len()
-    }
-}
-
-pub(super) trait InternalIterator {
-    fn seek(&mut self, key: &InternalKey);
-    fn seek_to_first(&mut self);
-    fn seek_to_last(&mut self);
-    fn valid(&self) -> bool;
-    fn key(&self) -> Option<&InternalKey>;
-    fn next(&mut self);
-    fn prev(&mut self);
-}
 
 type Table = SkipList<InternalKey>;
 type TableIter = SkipListIter<InternalKey>;

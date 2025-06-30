@@ -1,3 +1,4 @@
+use crate::DBError;
 use crate::util;
 use dbformat::MAX_SEQUENCE_NUMBER;
 use dbformat::SequenceNumber;
@@ -7,18 +8,18 @@ use skiplist::Key;
 use skiplist::Size;
 
 mod db_impl;
-mod dbformat;
+pub(crate) mod dbformat;
 pub(crate) mod memtable;
 mod skiplist;
 
 pub(super) trait InternalIterator {
-    fn seek(&mut self, key: &InternalKey);
-    fn seek_to_first(&mut self);
-    fn seek_to_last(&mut self);
+    fn seek(&mut self, key: &InternalKey) -> Result<(), DBError>;
+    fn seek_to_first(&mut self) -> Result<(), DBError>;
+    fn seek_to_last(&mut self) -> Result<(), DBError>;
     fn valid(&self) -> bool;
     fn key(&self) -> Option<&InternalKey>;
-    fn next(&mut self);
-    fn prev(&mut self);
+    fn next(&mut self) -> Result<(), DBError>;
+    fn prev(&mut self) -> Result<(), DBError>;
 }
 
 pub(crate) struct InternalKey {
@@ -136,12 +137,20 @@ impl InternalKey {
     }
 
     pub fn decode(buf: &[u8]) -> Option<Self> {
-        // 解析 user_key + 8字节 tag
+        // 解析 user_key + 8字节 tag + value
         if buf.len() < 8 {
             return None;
         }
-        let user_key = buf[..buf.len() - 8].to_vec();
-        let tag_bytes = &buf[buf.len() - 8..];
+        // 先解析 user_key + tag
+        let mut pos = 0;
+        // 解析 user_key 长度
+        let (key_len, n1) = util::decode_varint32(&buf[pos..])?;
+        pos += n1;
+        if buf.len() < pos + key_len as usize {
+            return None;
+        }
+        let user_key = buf[pos..pos + key_len as usize - 8].to_vec();
+        let tag_bytes = &buf[pos + key_len as usize - 8..pos + key_len as usize];
         let packed = u64::from_le_bytes(tag_bytes.try_into().ok()?);
         let sequence = packed >> 8;
         let value_type = match (packed & 0xFF) as u8 {
@@ -150,11 +159,19 @@ impl InternalKey {
             0x10 => ValueType::TypeNotSet,
             _ => return None,
         };
+        pos += key_len as usize;
+        // 解析 value 长度
+        let (value_len, n2) = util::decode_varint32(&buf[pos..])?;
+        pos += n2;
+        if buf.len() < pos + value_len as usize {
+            return None;
+        }
+        let value = buf[pos..pos + value_len as usize].to_vec();
         Some(InternalKey {
             user_key,
             sequence,
             value_type,
-            value: vec![], // value 由 entry value 字段单独存储
+            value,
         })
     }
 }

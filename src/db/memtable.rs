@@ -80,16 +80,19 @@ impl MemTableIter {
 }
 
 impl InternalIterator for MemTableIter {
-    fn seek(&mut self, key: &InternalKey) {
+    fn seek(&mut self, key: &InternalKey) -> Result<(), DBError> {
         self.iter.seek(key);
+        Ok(())
     }
 
-    fn seek_to_first(&mut self) {
+    fn seek_to_first(&mut self) -> Result<(), DBError> {
         self.iter.seek_to_first();
+        Ok(())
     }
 
-    fn seek_to_last(&mut self) {
+    fn seek_to_last(&mut self) -> Result<(), DBError> {
         self.iter.seek_to_last();
+        Ok(())
     }
 
     fn valid(&self) -> bool {
@@ -100,12 +103,14 @@ impl InternalIterator for MemTableIter {
         self.iter.key()
     }
 
-    fn next(&mut self) {
+    fn next(&mut self) -> Result<(), DBError> {
         self.iter.next();
+        Ok(())
     }
 
-    fn prev(&mut self) {
+    fn prev(&mut self) -> Result<(), DBError> {
         self.iter.prev();
+        Ok(())
     }
 }
 

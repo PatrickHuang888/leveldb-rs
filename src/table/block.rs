@@ -54,8 +54,7 @@ num_restarts：restart 点数量（4 字节）
 
 */
 
-use crate::util::{decode_varint32, encode_varint32};
-use core::num;
+use crate::util::encode_varint32;
 use std::cmp;
 
 pub struct BlockBuilder {
@@ -152,82 +151,121 @@ pub struct BlockIter<'a> {
     key: Option<InternalKey>,
     value_range: Option<(usize, usize)>,
     valid: bool,
-    last_key: Option<InternalKey>,
+    last_key: Option<Vec<u8>>,
+    // current 用来判断 prev到达第一的位置，因为读是往后读的，offset 也是下一个记录的起点
+    // prev 到头的时候无法判断
+    current: usize,
 }
+
+// value_end, key, (value_start, value_end)
+type BlockEntry = (usize, InternalKey, (usize, usize));
+type BlockEntryResult = Result<Option<BlockEntry>, DBError>;
 
 impl<'a> BlockIter<'a> {
     pub fn new(block: &'a Block<'a>) -> Self {
-        let mut iter = BlockIter {
+        BlockIter {
             block,
             offset: 0,
             key: None,
             value_range: None,
             valid: false,
             last_key: None,
-        };
-        iter.seek_to_first();
-        iter
+            current: 0,
+        }
     }
 
-    fn parse_entry(&mut self, offset: usize) -> Option<(usize, InternalKey, (usize, usize))> {
+    fn parse_entry(&mut self, offset: usize) -> BlockEntryResult {
         let data = &self.block.data;
         if offset >= data.len() {
-            return None;
+            return Ok(None);
         }
-        let (shared, n1) = util::decode_varint32(&data[offset..])?;
-        let (non_shared, n2) = util::decode_varint32(&data[offset + n1..])?;
-        let (value_len, n3) = util::decode_varint32(&data[offset + n1 + n2..])?;
+        // 解析 shared, non_shared, value_len
+        let (shared, n1) = util::decode_varint32(&data[offset..]).ok_or(DBError::Corruption)?;
+        let (non_shared, n2) =
+            util::decode_varint32(&data[offset + n1..]).ok_or(DBError::Corruption)?;
+        let (value_len, n3) =
+            util::decode_varint32(&data[offset + n1 + n2..]).ok_or(DBError::Corruption)?;
         let key_start = offset + n1 + n2 + n3;
         let key_end = key_start + non_shared as usize;
         let value_start = key_end;
         let value_end = value_start + value_len as usize;
         let mut key_bytes = match &self.last_key {
             Some(last) => {
-                let mut v = last.encode();
+                let mut v = last.clone();
                 v.truncate(shared as usize);
                 v
             }
             None => Vec::new(),
         };
         key_bytes.extend_from_slice(&data[key_start..key_end]);
-        let key = InternalKey::decode(&key_bytes)?;
-        Some((value_end, key, (value_start, value_end)))
+        // 组装 InternalKey 的完整 entry 字节（key + value）
+        let mut entry_bytes = key_bytes.clone();
+        // 追加 value 的 varint32 长度和内容
+        let mut value_len_buf = Vec::new();
+        util::encode_varint32(&mut value_len_buf, value_len);
+        entry_bytes.extend_from_slice(&value_len_buf);
+        entry_bytes.extend_from_slice(&data[value_start..value_end]);
+        let key = InternalKey::decode(&entry_bytes).ok_or(DBError::Corruption)?;
+        self.last_key = Some(key_bytes.clone());
+        Ok(Some((value_end, key, (value_start, value_end))))
     }
 
     fn entry_offset_by_restart(&self, restart_idx: usize) -> usize {
+        debug_assert!(
+            restart_idx < self.block.num_restarts,
+            "restart_idx out of bounds"
+        );
         let off = &self.block.restarts[restart_idx * 4..restart_idx * 4 + 4];
         u32::from_le_bytes(off.try_into().unwrap()) as usize
     }
+
+    fn corruption(&mut self) -> Result<(), DBError> {
+        self.valid = false;
+        self.key = None;
+        self.value_range = None;
+        self.offset = 0;
+        self.last_key = None;
+        Err(DBError::Corruption)
+    }
 }
 
-impl<'a> InternalIterator for BlockIter<'a> {
-    fn seek(&mut self, target: &InternalKey) {
+impl InternalIterator for BlockIter<'_> {
+    fn seek(&mut self, target: &InternalKey) -> Result<(), DBError> {
         // 二分查找 restart 点
         let mut left = 0;
-        let mut right = self.block.num_restarts;
+        let mut right = self.block.num_restarts - 1;
         while left < right {
-            let mid = (left + right) / 2;
+            let mid = (left + right + 1) / 2;
             let off = self.entry_offset_by_restart(mid);
-            let tmp_last_key: Option<InternalKey> = None;
-            let (shared, n1) = util::decode_varint32(&self.block.data[off..]).unwrap();
-            let (non_shared, n2) = util::decode_varint32(&self.block.data[off + n1..]).unwrap();
-            let (_value_len, n3) =
-                util::decode_varint32(&self.block.data[off + n1 + n2..]).unwrap();
+            let (_, n1) = match util::decode_varint32(&self.block.data[off..]) {
+                Some(v) => v,
+                None => {
+                    return self.corruption();
+                }
+            };
+            let (non_shared, n2) = match util::decode_varint32(&self.block.data[off + n1..]) {
+                Some(v) => v,
+                None => {
+                    return self.corruption();
+                }
+            };
+            let (_value_len, n3) = match util::decode_varint32(&self.block.data[off + n1 + n2..]) {
+                Some(v) => v,
+                None => {
+                    return self.corruption();
+                }
+            };
             let key_start = off + n1 + n2 + n3;
             let key_end = key_start + non_shared as usize;
-            let mut key_bytes = match &tmp_last_key {
-                Some(last) => {
-                    let mut v = last.encode();
-                    v.truncate(shared as usize);
-                    v
-                }
-                None => Vec::new(),
-            };
+            let mut key_bytes = Vec::new(); // restart点一定是完整key
             key_bytes.extend_from_slice(&self.block.data[key_start..key_end]);
-            let key = InternalKey::decode(&key_bytes).unwrap();
-            match key.cmp(target) {
-                std::cmp::Ordering::Less => left = mid + 1,
-                _ => right = mid,
+            let key = match InternalKey::decode(&key_bytes) {
+                Some(k) => k,
+                None => return self.corruption(),
+            };
+            match key.user_key().cmp(target.user_key()) {
+                std::cmp::Ordering::Less => left = mid,
+                _ => right = mid - 1,
             }
         }
         // 线性扫描
@@ -238,124 +276,487 @@ impl<'a> InternalIterator for BlockIter<'a> {
         };
         self.last_key = None;
         loop {
-            if let Some((next_offset, key, value_range)) = self.parse_entry(offset) {
-                match key.cmp(target) {
+            let entry = self.parse_entry(offset)?;
+            if let Some((next_offset, key, value_range)) = entry {
+                match key.user_key().cmp(target.user_key()) {
                     std::cmp::Ordering::Less => {
                         offset = next_offset;
-                        self.last_key = Some(key);
+                        self.last_key = Some(key.encode());
                     }
                     _ => {
                         self.key = Some(key.clone());
                         self.value_range = Some(value_range);
+                        self.current = offset;
                         self.offset = next_offset;
                         self.valid = true;
-                        self.last_key = Some(key);
-                        return;
+                        self.last_key = Some(key.encode());
+                        return Ok(());
                     }
                 }
             } else {
                 self.valid = false;
-                return;
+                return Ok(());
             }
         }
     }
 
-    fn seek_to_first(&mut self) {
+    fn seek_to_first(&mut self) -> Result<(), DBError> {
         self.offset = 0;
         self.last_key = None;
-        if let Some((next_offset, key, value_range)) = self.parse_entry(self.offset) {
+        let entry = self.parse_entry(self.offset)?;
+        if let Some((next_offset, key, value_range)) = entry {
             self.key = Some(key.clone());
             self.value_range = Some(value_range);
+            self.current = self.offset;
             self.offset = next_offset;
             self.valid = true;
-            self.last_key = Some(key);
+            self.last_key = Some(key.encode());
         } else {
             self.valid = false;
         }
+        Ok(())
     }
-    fn seek_to_last(&mut self) {
+
+    fn seek_to_last(&mut self) -> Result<(), DBError> {
         // 定位到最后一个 restart 点
         if self.block.num_restarts == 0 {
             self.valid = false;
-            return;
+            return Err(DBError::Corruption);
         }
-        let mut restart_idx = self.block.num_restarts - 1;
+        let restart_idx = self.block.num_restarts - 1;
         let mut offset = self.entry_offset_by_restart(restart_idx);
         self.last_key = None;
         let mut last_valid = None;
-        while let Some((next_offset, key, value_range)) = self.parse_entry(offset) {
-            last_valid = Some((offset, key.clone(), value_range));
-            offset = next_offset;
-            self.last_key = Some(key);
+        loop {
+            let entry = match self.parse_entry(offset) {
+                Ok(e) => e,
+                Err(_) => return self.corruption(),
+            };
+            if let Some((next_offset, key, value_range)) = entry {
+                last_valid = Some((offset, key.clone(), value_range));
+                offset = next_offset;
+                self.last_key = Some(key.encode());
+            } else {
+                break;
+            }
         }
         if let Some((off, key, value_range)) = last_valid {
             self.offset = off;
-            self.key = Some(key);
+            self.current = offset;
+            self.key = Some(key.clone());
             self.value_range = Some(value_range);
             self.valid = true;
+            self.last_key = Some(key.encode());
         } else {
             self.valid = false;
         }
+        Ok(())
     }
+
     fn valid(&self) -> bool {
         self.valid
     }
     fn key(&self) -> Option<&InternalKey> {
         self.key.as_ref()
     }
-    fn next(&mut self) {
-        if !self.valid {
-            return;
-        }
+
+    fn next(&mut self) -> Result<(), DBError> {
+        assert!(self.valid, "Iterator is not valid");
         let offset = self.offset;
-        if let Some((next_offset, key, value_range)) = self.parse_entry(offset) {
+        let entry = match self.parse_entry(offset) {
+            Ok(e) => e,
+            Err(_) => return self.corruption(),
+        };
+        if let Some((next_offset, key, value_range)) = entry {
             self.key = Some(key.clone());
             self.value_range = Some(value_range);
             self.offset = next_offset;
+            self.current = offset;
             self.valid = true;
-            self.last_key = Some(key);
+            self.last_key = Some(key.encode());
         } else {
             self.valid = false;
         }
+        Ok(())
     }
 
-    fn prev(&mut self) {
+    fn prev(&mut self) -> Result<(), DBError> {
         // 只能从 restart 点往前线性扫描
         if !self.valid {
-            return;
+            return Ok(());
         }
+
+        if self.current == 0 {
+            // 如果已经是第一个 entry，直接无效化
+            self.valid = false;
+            return Ok(());
+        }
+
         // 找到当前 entry 属于哪个 restart 区间
-        let mut restart_idx = 0;
         let mut entry_offset = 0;
         for i in 0..self.block.num_restarts {
             let off = self.entry_offset_by_restart(i);
             if off >= self.offset {
                 break;
             }
-            restart_idx = i;
             entry_offset = off;
         }
+
+        // 线性扫描找到前一个 entry
         let mut last_valid = None;
         self.last_key = None;
         while entry_offset < self.offset {
-            if let Some((next_offset, key, value_range)) = self.parse_entry(entry_offset) {
+            let entry = match self.parse_entry(entry_offset) {
+                Ok(e) => e,
+                Err(_) => return self.corruption(),
+            };
+            if let Some((next_offset, key, value_range)) = entry {
                 if next_offset == self.offset {
+                    last_valid = Some((entry_offset, key.clone(), value_range));
                     break;
                 }
                 last_valid = Some((entry_offset, key.clone(), value_range));
                 entry_offset = next_offset;
-                self.last_key = Some(key);
+                self.last_key = Some(key.encode());
             } else {
                 break;
             }
         }
+
         if let Some((off, key, value_range)) = last_valid {
+            self.current = entry_offset;
             self.offset = off;
-            self.key = Some(key);
+            self.key = Some(key.clone());
             self.value_range = Some(value_range);
             self.valid = true;
+            self.last_key = Some(key.encode());
         } else {
             self.valid = false;
         }
+
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Options;
+    use crate::db::InternalKey;
+    use crate::db::dbformat::ValueType;
+
+    fn make_internal_key(user_key: &[u8], seq: u64, value: &[u8]) -> InternalKey {
+        InternalKey::new(user_key, seq, ValueType::TypeValue, value)
+    }
+
+    /// 正常 block 构建、正序/逆序遍历、seek、边界 seek 行为的回归测试
+    #[test]
+    fn test_blockbuilder_and_block_roundtrip() {
+        let mut opts = Options::default();
+        opts.block_restart_interval = 2;
+        let mut builder = BlockBuilder::new(opts.clone());
+        let keys: Vec<&[u8]> = vec![b"a" as &[u8], b"ab", b"abc", b"b", b"c"];
+        let values: Vec<&[u8]> = vec![b"1", b"2", b"3", b"4", b"5"];
+        let mut internal_keys = vec![];
+        for (i, (k, v)) in keys.iter().zip(values.iter()).enumerate() {
+            let ikey = make_internal_key(k, i as u64, v);
+            builder.add(&ikey);
+            internal_keys.push(ikey);
+        }
+        let block_data = builder.finish();
+        let block = Block::new(&block_data);
+        let mut iter = BlockIter::new(&block);
+        // 正序遍历
+        iter.seek_to_first().unwrap();
+        let mut got = vec![];
+        while iter.valid() {
+            let k = iter.key().unwrap();
+            got.push((k.user_key().to_vec(), k.value().to_vec()));
+            iter.next().unwrap();
+        }
+        let expected: Vec<(Vec<u8>, Vec<u8>)> = keys
+            .iter()
+            .zip(values.iter())
+            .map(|(k, v)| (k.to_vec(), v.to_vec()))
+            .collect();
+        assert_eq!(got, expected);
+        // 逆序遍历
+        iter.seek_to_last().unwrap();
+        let mut got_rev = vec![];
+        while iter.valid() {
+            let k = iter.key().unwrap();
+            got_rev.push((k.user_key().to_vec(), k.value().to_vec()));
+            iter.prev().unwrap();
+        }
+        let mut expected_rev = expected.clone();
+        expected_rev.reverse();
+        assert_eq!(got_rev, expected_rev);
+
+        // seek 测试
+        for (i, k) in keys.iter().enumerate() {
+            let target = make_internal_key(k, i as u64, b""); // value 字段可为空
+            iter.seek(&target).unwrap();
+            assert!(iter.valid());
+            let got_key = iter.key().unwrap();
+            assert_eq!(got_key.user_key(), *k);
+            assert_eq!(got_key.value(), values[i]);
+            // next 检查
+            iter.next().unwrap();
+            if i + 1 < keys.len() {
+                assert!(iter.valid());
+                let next_key = iter.key().unwrap();
+                assert_eq!(next_key.user_key(), keys[i + 1]);
+                assert_eq!(next_key.value(), values[i + 1]);
+            } else {
+                assert!(!iter.valid());
+            }
+            // 再 seek 回来
+            iter.seek(&target).unwrap();
+            assert!(iter.valid());
+            // prev 检查
+            iter.prev().unwrap();
+            if i == 0 {
+                assert!(!iter.valid());
+            } else {
+                assert!(iter.valid());
+                let prev_key = iter.key().unwrap();
+                assert_eq!(prev_key.user_key(), keys[i]);
+                assert_eq!(prev_key.value(), values[i]);
+                iter.next().unwrap(); // 恢复到下一个
+                assert!(iter.valid());
+                assert_eq!(iter.key().unwrap().user_key(), keys[i]);
+                assert_eq!(iter.key().unwrap().value(), values[i]);
+            }
+        }
+        // seek 不存在的 key，应该定位到大于等于该 key 的 entry 或无效
+        let not_exist = make_internal_key(b"ba", 0, b"");
+        iter.seek(&not_exist).unwrap();
+        assert!(iter.valid());
+        let got_key = iter.key().unwrap();
+        // "ba" 介于 "b" 和 "c" 之间，应该定位到 "c"
+        assert_eq!(got_key.user_key(), b"c");
+        assert_eq!(got_key.value(), b"5");
+
+        // seek 到比最小 key 还小的 key，应返回第一个 entry
+        let min_key = make_internal_key(b"", 0, b"");
+        iter.seek(&min_key).unwrap();
+        assert!(iter.valid());
+        let got_key = iter.key().unwrap();
+        assert_eq!(got_key.user_key(), b"a");
+        assert_eq!(got_key.value(), b"1");
+
+        // seek 到比最大 key 还大的 key，应 invalid
+        let max_key = make_internal_key(b"z", 0, b"");
+        iter.seek(&max_key).unwrap();
+        // "z" > "c"，应无效
+        assert!(!iter.valid());
+
+        // seek 到 block 里不存在但靠近 restart 点的 key
+        let near_restart1 = make_internal_key(b"aa", 0, b"");
+        iter.seek(&near_restart1).unwrap();
+        assert!(iter.valid());
+        let got_key = iter.key().unwrap();
+        // "aa" 介于 "a" 和 "ab" 之间，应返回 "ab"
+        assert_eq!(got_key.user_key(), b"ab");
+        assert_eq!(got_key.value(), b"2");
+
+        let near_restart2 = make_internal_key(b"bb", 0, b"");
+        iter.seek(&near_restart2).unwrap();
+        assert!(iter.valid());
+        let got_key = iter.key().unwrap();
+        // "bb" 介于 "b" 和 "c" 之间，应返回 "c"
+        assert_eq!(got_key.user_key(), b"c");
+        assert_eq!(got_key.value(), b"5");
+    }
+
+    /// 空 block 的行为，iter 应 invalid
+    #[test]
+    fn test_blockbuilder_empty() {
+        let opts = Options::default();
+        let builder = BlockBuilder::new(opts);
+        assert!(builder.is_empty());
+        let data = builder.finish();
+        let block = Block::new(&data);
+        let iter = BlockIter::new(&block);
+        assert!(!iter.valid());
+    }
+
+    /// 只有一个 entry 且为 restart 点，测试 next/prev/seek 边界
+    #[test]
+    fn test_blockbuilder_single_entry_restart() {
+        let opts = Options {
+            block_restart_interval: 16,
+            ..Default::default()
+        };
+        let mut builder = BlockBuilder::new(opts.clone());
+        let key = make_internal_key(b"x", 1, b"v");
+        builder.add(&key);
+        let block_data = builder.finish();
+        let block = Block::new(&block_data);
+        let mut iter = BlockIter::new(&block);
+        iter.seek_to_first().unwrap();
+        assert!(iter.valid());
+        assert_eq!(iter.key().unwrap().user_key(), b"x");
+        assert_eq!(iter.key().unwrap().value(), b"v");
+        iter.next().unwrap();
+        assert!(!iter.valid());
+        iter.seek_to_last().unwrap();
+        assert!(iter.valid());
+        iter.prev().unwrap();
+        assert!(!iter.valid());
+    }
+
+    /// 所有 entry 都是 restart 点（block_restart_interval=1），测试遍历
+    #[test]
+    fn test_blockbuilder_all_restart_points() {
+        let opts = Options {
+            block_restart_interval: 1,
+            ..Default::default()
+        };
+        let mut builder = BlockBuilder::new(opts.clone());
+        let keys = [b"a", b"b", b"c"];
+        let values = [b"1", b"2", b"3"];
+        for (i, (k, v)) in keys.iter().zip(values.iter()).enumerate() {
+            let ikey = make_internal_key(*k, i as u64, *v);
+            builder.add(&ikey);
+        }
+        let block_data = builder.finish();
+        let block = Block::new(&block_data);
+        let mut iter = BlockIter::new(&block);
+        iter.seek_to_first().unwrap();
+        assert!(iter.valid());
+        assert_eq!(iter.key().unwrap().user_key(), b"a");
+        iter.next().unwrap();
+        assert!(iter.valid());
+        assert_eq!(iter.key().unwrap().user_key(), b"b");
+        iter.next().unwrap();
+        assert!(iter.valid());
+        assert_eq!(iter.key().unwrap().user_key(), b"c");
+        iter.next().unwrap();
+        assert!(!iter.valid());
+    }
+
+    /// key 为空、value 为空的 entry，测试遍历和内容
+    #[test]
+    fn test_blockbuilder_empty_key_and_value() {
+        let opts = Options {
+            block_restart_interval: 2,
+            ..Default::default()
+        };
+        let mut builder = BlockBuilder::new(opts.clone());
+        let k1 = make_internal_key(b"", 1, b"v1");
+        let k2 = make_internal_key(b"k2", 2, b"");
+        builder.add(&k1);
+        builder.add(&k2);
+        let block_data = builder.finish();
+        let block = Block::new(&block_data);
+        let mut iter = BlockIter::new(&block);
+        iter.seek_to_first().unwrap();
+        assert!(iter.valid());
+        assert_eq!(iter.key().unwrap().user_key(), b"");
+        assert_eq!(iter.key().unwrap().value(), b"v1");
+        iter.next().unwrap();
+        assert!(iter.valid());
+        assert_eq!(iter.key().unwrap().user_key(), b"k2");
+        assert_eq!(iter.key().unwrap().value(), b"");
+    }
+
+    /// 极端长 key/value，测试大数据 entry 的正确性
+    #[test]
+    fn test_blockbuilder_long_key_value() {
+        let opts = Options {
+            block_restart_interval: 2,
+            ..Default::default()
+        };
+        let mut builder = BlockBuilder::new(opts.clone());
+        let long_key = vec![b'x'; 1024];
+        let long_val = vec![b'y'; 2048];
+        let k1 = make_internal_key(&long_key, 1, &long_val);
+        builder.add(&k1);
+        let block_data = builder.finish();
+        let block = Block::new(&block_data);
+        let mut iter = BlockIter::new(&block);
+        iter.seek_to_first().unwrap();
+        assert!(iter.valid());
+        assert_eq!(iter.key().unwrap().user_key(), &long_key[..]);
+        assert_eq!(iter.key().unwrap().value(), &long_val[..]);
+    }
+
+    /// 重复 user_key 但 seq 不同，测试 entry 顺序和内容
+    #[test]
+    fn test_blockbuilder_duplicate_user_key_diff_seq() {
+        let opts = Options {
+            block_restart_interval: 2,
+            ..Default::default()
+        };
+        let mut builder = BlockBuilder::new(opts.clone());
+        let k1 = make_internal_key(b"dup", 1, b"v1");
+        let k2 = make_internal_key(b"dup", 2, b"v2");
+        builder.add(&k1);
+        builder.add(&k2);
+        let block_data = builder.finish();
+        let block = Block::new(&block_data);
+        let mut iter = BlockIter::new(&block);
+        iter.seek_to_first().unwrap();
+        assert!(iter.valid());
+        assert_eq!(iter.key().unwrap().user_key(), b"dup");
+        assert_eq!(iter.key().unwrap().value(), b"v1");
+        iter.next().unwrap();
+        assert!(iter.valid());
+        assert_eq!(iter.key().unwrap().user_key(), b"dup");
+        assert_eq!(iter.key().unwrap().value(), b"v2");
+    }
+
+    /// seek 到正好等于 restart 点的 key，测试定位准确性
+    #[test]
+    fn test_blockbuilder_seek_restart_point() {
+        let opts = Options {
+            block_restart_interval: 2,
+            ..Default::default()
+        };
+        let mut builder = BlockBuilder::new(opts.clone());
+        let keys = [b"a", b"b", b"c", b"d"];
+        let values = [b"1", b"2", b"3", b"4"];
+        for (i, (k, v)) in keys.iter().zip(values.iter()).enumerate() {
+            let ikey = make_internal_key(*k, i as u64, *v);
+            builder.add(&ikey);
+        }
+        let block_data = builder.finish();
+        let block = Block::new(&block_data);
+        let mut iter = BlockIter::new(&block);
+        // seek 到 restart 点 "a"、"c"
+        let t1 = make_internal_key(b"a", 0, b"");
+        iter.seek(&t1).unwrap();
+        assert!(iter.valid());
+        assert_eq!(iter.key().unwrap().user_key(), b"a");
+        let t2 = make_internal_key(b"c", 0, b"");
+        iter.seek(&t2).unwrap();
+        assert!(iter.valid());
+        assert_eq!(iter.key().unwrap().user_key(), b"c");
+    }
+
+    /// block_restart_interval 恰好等于 entry 数，测试首尾遍历
+    #[test]
+    fn test_blockbuilder_restart_interval_eq_entry_count() {
+        let opts = Options {
+            block_restart_interval: 4,
+            ..Default::default()
+        };
+        let mut builder = BlockBuilder::new(opts.clone());
+        let keys = [b"a", b"b", b"c", b"d"];
+        let values = [b"1", b"2", b"3", b"4"];
+        for (i, (k, v)) in keys.iter().zip(values.iter()).enumerate() {
+            let ikey = make_internal_key(*k, i as u64, *v);
+            builder.add(&ikey);
+        }
+        let block_data = builder.finish();
+        let block = Block::new(&block_data);
+        let mut iter = BlockIter::new(&block);
+        iter.seek_to_first().unwrap();
+        assert!(iter.valid());
+        assert_eq!(iter.key().unwrap().user_key(), b"a");
+        iter.seek_to_last().unwrap();
+        assert!(iter.valid());
+        assert_eq!(iter.key().unwrap().user_key(), b"d");
     }
 }

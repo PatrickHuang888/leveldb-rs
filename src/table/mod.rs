@@ -3,7 +3,6 @@ use crate::util;
 
 mod block;
 mod table;
-mod table_builder;
 
 const BL_MAX_ENCODED_LENGTH: usize = 10 + 10;
 pub(crate) struct BlockHandle {

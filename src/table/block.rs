@@ -1,3 +1,4 @@
+use super::table::BlockHandle;
 use crate::Options;
 use crate::db::InternalIterator;
 use crate::db::InternalKey;
@@ -102,6 +103,15 @@ impl BlockBuilder {
         self.last_key.clear();
         self.last_key.extend_from_slice(&key_bytes);
         self.counter += 1;
+    }
+
+    /// 用于 index_block
+    pub fn add_handle(&mut self, key: &[u8], handle: &BlockHandle) {
+        let mut value = Vec::new();
+        handle.encode_to(&mut value);
+        // sequence 和 value_type 在 index block 中不需要
+        let ikey = InternalKey::new(key, 0, crate::db::dbformat::ValueType::TypeValue, &value);
+        self.add(&ikey);
     }
 
     pub fn finish(mut self) -> Vec<u8> {

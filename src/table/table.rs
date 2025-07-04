@@ -36,12 +36,15 @@ index_block 里的 key 是“data block 的分割 key”，即大于等于该 da
 */
 
 use crate::DBError;
+use crate::db::{InternalIterator, InternalKey};
+use crate::table::block::BlockIter;
 use crate::table::block::{Block, BlockBuilder};
 use crate::util::{decode_varint64, encode_varint64};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek};
+use std::io::{SeekFrom, Write};
 
 /// BlockHandle 结构
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlockHandle {
     pub offset: u64,
     pub size: u64,
@@ -92,8 +95,6 @@ impl Footer {
         })
     }
 }
-
-use crate::db::InternalKey;
 
 pub struct TableBuilder<W: Write + Seek> {
     writer: W,
@@ -201,8 +202,9 @@ impl<W: Write + Seek> TableBuilder<W> {
 /// Table 用于读取 Table 文件
 pub struct Table<R: Read + Seek> {
     reader: R,
-    pub index_handle: BlockHandle,
-    pub metaindex_handle: BlockHandle,
+    metaindex_handle: BlockHandle,
+
+    index_block: Block,
 }
 
 impl<R: Read + Seek> Table<R> {
@@ -213,19 +215,20 @@ impl<R: Read + Seek> Table<R> {
         reader.read_exact(&mut footer_bytes)?;
         let footer = Footer::decode_from(&footer_bytes)
             .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad footer"))?;
+        let index_block = Table::read_block(&mut reader, &footer.index_handle)?;
         Ok(Table {
             reader,
-            index_handle: footer.index_handle,
             metaindex_handle: footer.metaindex_handle,
+            index_block,
         })
     }
 
     /// 读取指定 Block
-    pub fn read_block(&mut self, handle: &BlockHandle) -> Result<Vec<u8>, DBError> {
-        self.reader.seek(SeekFrom::Start(handle.offset))?;
+    pub fn read_block(reader: &mut R, handle: &BlockHandle) -> Result<Block, DBError> {
+        reader.seek(SeekFrom::Start(handle.offset))?;
         let mut buf = vec![0u8; handle.size as usize];
-        self.reader.read_exact(&mut buf)?;
-        Ok(buf)
+        reader.read_exact(&mut buf)?;
+        Ok(Block::new(buf))
     }
     // 可扩展：查找 key、读取 filter block、metaindex block 等
 }
@@ -258,6 +261,155 @@ fn shortest_successor(key: &[u8]) -> Vec<u8> {
     res
 }
 
+pub struct TableIterator<R: Read + Seek> {
+    r: R,
+    index_iter: BlockIter,
+    data_iter: Option<BlockIter>,
+    valid: bool,
+    data_block_handle: Option<BlockHandle>,
+}
+impl<R: Read + Seek> TableIterator<R> {
+    pub fn new(r: R, index_iter: BlockIter) -> Self {
+        TableIterator {
+            r,
+            index_iter,
+            data_iter: None,
+            valid: false,
+            data_block_handle: None,
+        }
+    }
+
+    fn init_data_block(&mut self) -> Result<(), DBError> {
+        if !self.index_iter.valid() {
+            self.valid = false;
+            self.data_iter = None;
+            return Ok(());
+        }
+
+        if let Some((handle, _)) = BlockHandle::decode_from(self.index_iter.key().unwrap().value())
+        {
+            let need_reload = !matches!(self.data_block_handle.as_ref(), Some(h) if self.data_iter.is_some() && h == &handle);
+            if need_reload {
+                let data_block =
+                    Table::read_block(&mut self.r, &handle).inspect_err(|_| self.valid = false)?;
+                self.data_iter = Some(BlockIter::new(data_block));
+                self.data_block_handle = Some(handle);
+            }
+            Ok(())
+        } else {
+            self.valid = false;
+            Err(DBError::Corruption)
+        }
+    }
+
+    fn skip_data_block_backward(&mut self) -> Result<(), DBError> {
+        while self.data_iter.is_some() && (!self.data_iter.as_ref().unwrap().valid()) {
+            // 用在 prev 里到头了？
+            if !self.index_iter.valid() {
+                self.valid = false;
+                return Ok(());
+            }
+            self.index_iter.prev()?;
+            self.init_data_block()?;
+            if let Some(data_iter) = self.data_iter.as_mut() {
+                data_iter.seek_to_last()?;
+                self.valid = data_iter.valid();
+            }
+        }
+        Ok(())
+    }
+
+    fn skip_data_block_forward(&mut self) -> Result<(), DBError> {
+        while self.data_iter.is_some() && (!self.data_iter.as_ref().unwrap().valid()) {
+            // 用在 next 里到尾了？
+            if !self.index_iter.valid() {
+                self.valid = false;
+                return Ok(());
+            }
+            self.index_iter.next()?;
+            self.init_data_block()?;
+            if let Some(data_iter) = self.data_iter.as_mut() {
+                data_iter.seek_to_first()?;
+                self.valid = data_iter.valid();
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<R: Read + Seek> InternalIterator for TableIterator<R> {
+    fn seek(&mut self, key: &InternalKey) -> Result<(), DBError> {
+        self.index_iter.seek(key)?;
+        self.init_data_block()?;
+        if let Some(data_iter) = self.data_iter.as_mut() {
+            data_iter.seek(key)?;
+            self.valid = data_iter.valid();
+        }
+        Ok(())
+    }
+
+    fn seek_to_first(&mut self) -> Result<(), DBError> {
+        self.index_iter.seek_to_first()?;
+        self.init_data_block()?;
+        if let Some(data_iter) = self.data_iter.as_mut() {
+            data_iter.seek_to_first()?;
+            self.valid = data_iter.valid();
+        }
+        Ok(())
+    }
+
+    fn seek_to_last(&mut self) -> Result<(), DBError> {
+        self.index_iter.seek_to_last()?;
+        self.init_data_block()?;
+        if let Some(data_iter) = self.data_iter.as_mut() {
+            data_iter.seek_to_last()?;
+            self.valid = data_iter.valid();
+        }
+        Ok(())
+    }
+
+    fn valid(&self) -> bool {
+        self.valid
+    }
+
+    fn key(&self) -> Option<&InternalKey> {
+        self.data_iter.as_ref().and_then(|it| it.key())
+    }
+
+    fn next(&mut self) -> Result<(), DBError> {
+        if let Some(data_iter) = self.data_iter.as_mut() {
+            data_iter.next()?;
+            if data_iter.valid() {
+                self.valid = true;
+                return Ok(());
+            } else {
+                // 如果 data_iter 无效，尝试跳过到下一个 index entry
+                self.skip_data_block_forward()?;
+            }
+        } else {
+            self.valid = false;
+        }
+        Ok(())
+    }
+
+    fn prev(&mut self) -> Result<(), DBError> {
+        assert!(self.valid, "prev called on invalid iterator");
+        if let Some(data_iter) = self.data_iter.as_mut() {
+            data_iter.prev()?;
+            if data_iter.valid() {
+                self.valid = true;
+                return Ok(());
+            } else {
+                // 如果 data_iter 无效，尝试回退到上一个 index entry
+                self.skip_data_block_backward()?;
+            }
+        } else {
+            self.valid = false;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -285,27 +437,235 @@ mod tests {
         }
         // 读回 Table
         let mut table = Table::open(Cursor::new(&buf)).unwrap();
-        // 读取 index block
-        let index_handle = table.index_handle.clone();
-        let index_block_data = table.read_block(&index_handle).unwrap();
-        assert!(!index_block_data.is_empty());
+        // 直接使用 table.index_block
+        let index_block = table.index_block.clone();
+        assert!(!index_block.is_empty());
         // 读取第一个 data block
-        // 这里简单解析 index block，假设第一个 entry
-        let block = Block::new(&index_block_data);
-        let mut iter = crate::table::block::BlockIter::new(&block);
+        let mut iter = crate::table::block::BlockIter::new(index_block);
         iter.seek_to_first().unwrap();
         assert!(iter.valid());
         let handle_bytes = iter.key().unwrap().value();
         let mut handle_slice = handle_bytes;
         let (handle, _) = BlockHandle::decode_from(&mut handle_slice).unwrap();
-        let data_block = table.read_block(&handle).unwrap();
+        let data_block = Table::read_block(&mut table.reader, &handle).unwrap();
         // 校验 data block 内容
-        let block = Block::new(&data_block);
-        let mut iter = crate::table::block::BlockIter::new(&block);
+        let mut iter = crate::table::block::BlockIter::new(data_block);
         iter.seek_to_first().unwrap();
         assert!(iter.valid());
         let k = iter.key().unwrap();
         assert_eq!(k.user_key(), b"a");
         assert_eq!(k.value(), b"1");
+    }
+
+    #[test]
+    fn test_table_iterator_empty() {
+        // 空表
+        let mut buf = Vec::new();
+        {
+            let builder = TableBuilder::new(Cursor::new(&mut buf));
+            builder.finish().unwrap();
+        }
+        let table = Table::open(Cursor::new(&buf)).unwrap();
+        let index_block = table.index_block.clone();
+        let mut iter = TableIterator::new(
+            Cursor::new(&buf),
+            crate::table::block::BlockIter::new(index_block),
+        );
+        // 空表 valid 应为 false
+        assert!(!iter.valid());
+        assert!(iter.seek_to_first().is_ok());
+        assert!(!iter.valid());
+        assert!(iter.seek_to_last().is_ok());
+        assert!(!iter.valid());
+    }
+
+    #[test]
+    fn test_table_iterator_forward_and_backward() {
+        let mut buf = Vec::new();
+        let keys = [b"a", b"b", b"c", b"d"];
+        let values = [b"1", b"2", b"3", b"4"];
+        {
+            let mut builder = TableBuilder::new(Cursor::new(&mut buf));
+            for (i, (k, v)) in keys.iter().zip(values.iter()).enumerate() {
+                let ikey = make_internal_key(*k, i as u64, *v);
+                builder.add(&ikey).unwrap();
+            }
+            builder.finish().unwrap();
+        }
+        let table = Table::open(Cursor::new(&buf)).unwrap();
+        let index_block = table.index_block.clone();
+        let mut iter = TableIterator::new(
+            Cursor::new(&buf),
+            crate::table::block::BlockIter::new(index_block),
+        );
+        // 正序遍历
+        iter.seek_to_first().unwrap();
+        let mut result = Vec::new();
+        while iter.valid() {
+            let k = iter.key().unwrap();
+            result.push((k.user_key().to_vec(), k.value().to_vec()));
+            iter.next().unwrap();
+        }
+        assert_eq!(
+            result,
+            keys.iter()
+                .zip(values.iter())
+                .map(|(k, v)| (k.to_vec(), v.to_vec()))
+                .collect::<Vec<_>>()
+        );
+        // 逆序遍历
+        iter.seek_to_last().unwrap();
+        let mut result = Vec::new();
+        while iter.valid() {
+            let k = iter.key().unwrap();
+            result.push((k.user_key().to_vec(), k.value().to_vec()));
+            iter.prev().unwrap();
+        }
+        let mut expect = keys
+            .iter()
+            .zip(values.iter())
+            .map(|(k, v)| (k.to_vec(), v.to_vec()))
+            .collect::<Vec<_>>();
+        expect.reverse();
+        assert_eq!(result, expect);
+    }
+
+    #[test]
+    fn test_table_iterator_seek_with_next_prev() {
+        let mut buf = Vec::new();
+        let keys = [b"a", b"c", b"e", b"g"];
+        let values = [b"1", b"2", b"3", b"4"];
+        {
+            let mut builder = TableBuilder::new(Cursor::new(&mut buf));
+            for (i, (k, v)) in keys.iter().zip(values.iter()).enumerate() {
+                let ikey = make_internal_key(*k, i as u64, *v);
+                builder.add(&ikey).unwrap();
+            }
+            builder.finish().unwrap();
+        }
+        let table = Table::open(Cursor::new(&buf)).unwrap();
+        let index_block = table.index_block.clone();
+        let mut iter = TableIterator::new(
+            Cursor::new(&buf),
+            crate::table::block::BlockIter::new(index_block),
+        );
+
+        // seek 到 "c"，next 应该到 "e"，prev 应该到 "a"
+        let ikey = make_internal_key(b"c", 0, b"");
+        iter.seek(&ikey).unwrap();
+        assert!(iter.valid());
+        assert_eq!(iter.key().unwrap().user_key(), b"c");
+
+        iter.next().unwrap();
+        assert!(iter.valid());
+        assert_eq!(iter.key().unwrap().user_key(), b"e");
+
+        iter.prev().unwrap();
+        assert!(iter.valid());
+        assert_eq!(iter.key().unwrap().user_key(), b"c");
+
+        iter.prev().unwrap();
+        assert!(iter.valid());
+        assert_eq!(iter.key().unwrap().user_key(), b"a");
+
+        // seek 到 "b"，应该到 "c"，next 到 "e"，prev 到 "a"
+        let ikey = make_internal_key(b"b", 0, b"");
+        iter.seek(&ikey).unwrap();
+        assert!(iter.valid());
+        assert_eq!(iter.key().unwrap().user_key(), b"c");
+
+        iter.next().unwrap();
+        assert!(iter.valid());
+        assert_eq!(iter.key().unwrap().user_key(), b"e");
+
+        iter.prev().unwrap();
+        assert!(iter.valid());
+        assert_eq!(iter.key().unwrap().user_key(), b"c");
+
+        iter.prev().unwrap();
+        assert!(iter.valid());
+        assert_eq!(iter.key().unwrap().user_key(), b"a");
+
+        // seek 到 "z"，应该 invalid
+        let ikey = make_internal_key(b"z", 0, b"");
+        iter.seek(&ikey).unwrap();
+        assert!(!iter.valid());
+    }
+
+    #[test]
+    fn test_table_iterator() {
+        let mut buf = Vec::new();
+        {
+            let mut builder = TableBuilder::new(Cursor::new(&mut buf));
+            let keys = [b"a", b"b", b"c", b"d", b"e"];
+            let values = [b"1", b"2", b"3", b"4", b"5"];
+            for (i, (k, v)) in keys.iter().zip(values.iter()).enumerate() {
+                let ikey = make_internal_key(*k, i as u64, *v);
+                builder.add(&ikey).unwrap();
+            }
+            builder.finish().unwrap();
+        }
+        let table = Table::open(Cursor::new(&buf)).unwrap();
+        let index_block = table.index_block.clone();
+        let mut iter = TableIterator::new(
+            Cursor::new(&buf),
+            crate::table::block::BlockIter::new(index_block),
+        );
+
+        // 正序遍历
+        iter.seek_to_first().unwrap();
+        let mut results = Vec::new();
+        while iter.valid() {
+            let k = iter.key().unwrap();
+            results.push((k.user_key().to_vec(), k.value().to_vec()));
+            iter.next().unwrap();
+        }
+        assert_eq!(
+            results,
+            vec![
+                (b"a".to_vec(), b"1".to_vec()),
+                (b"b".to_vec(), b"2".to_vec()),
+                (b"c".to_vec(), b"3".to_vec()),
+                (b"d".to_vec(), b"4".to_vec()),
+                (b"e".to_vec(), b"5".to_vec()),
+            ]
+        );
+
+        // 逆序遍历
+        iter.seek_to_last().unwrap();
+        let mut rev_results = Vec::new();
+        while iter.valid() {
+            let k = iter.key().unwrap();
+            rev_results.push((k.user_key().to_vec(), k.value().to_vec()));
+            iter.prev().unwrap();
+        }
+        assert_eq!(
+            rev_results,
+            vec![
+                (b"e".to_vec(), b"5".to_vec()),
+                (b"d".to_vec(), b"4".to_vec()),
+                (b"c".to_vec(), b"3".to_vec()),
+                (b"b".to_vec(), b"2".to_vec()),
+                (b"a".to_vec(), b"1".to_vec()),
+            ]
+        );
+
+        // seek 精确命中
+        iter.seek(&make_internal_key(b"c", 2, b"3")).unwrap();
+        assert!(iter.valid());
+        let k = iter.key().unwrap();
+        assert_eq!(k.user_key(), b"c");
+        assert_eq!(k.value(), b"3");
+
+        // seek 到不存在 key，应该到下一个更大 key
+        iter.seek(&make_internal_key(b"bb", 0, b"")).unwrap();
+        assert!(iter.valid());
+        let k = iter.key().unwrap();
+        assert_eq!(k.user_key(), b"c");
+        assert_eq!(k.value(), b"3");
+
+        // seek 超过最大 key
+        iter.seek(&make_internal_key(b"z", 0, b"")).unwrap();
+        assert!(!iter.valid());
     }
 }

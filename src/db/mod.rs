@@ -22,6 +22,7 @@ pub(super) trait InternalIterator {
     fn prev(&mut self) -> Result<(), DBError>;
 }
 
+#[derive(Debug)]
 pub(crate) struct InternalKey {
     user_key: Vec<u8>,
     sequence: SequenceNumber,

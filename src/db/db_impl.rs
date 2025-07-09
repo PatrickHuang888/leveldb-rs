@@ -1,10 +1,20 @@
 use super::InternalIterator;
 use super::InternalKey;
+use super::version::VersionEdit;
+use crate::DBConfig;
 use crate::DBError;
+use crate::db::dbformat::VALUE_TYPE_FOR_SEEK;
+use crate::db::version::FileMetaData;
+use crate::db::version::Version;
+use crate::db::version::VersionSet;
 use crate::db::{
     dbformat::{SequenceNumber, ValueType},
     memtable::{MemTable, MemTableIter},
 };
+use crate::table::table::TableBuilder;
+use std::fs::OpenOptions;
+use std::fs::remove_file;
+use std::sync::atomic::AtomicBool;
 use std::{cell::RefCell, rc::Rc, sync::Arc, sync::Mutex};
 use tokio::sync::{Notify, mpsc, oneshot};
 
@@ -44,114 +54,206 @@ struct DB {
     inner: Arc<Mutex<DBInner>>,
     tx: mpsc::Sender<WriteMsg>,
     last_sequence: Arc<Mutex<SequenceNumber>>,
-    compacting_notify: Arc<Notify>,
+    switch_notify: Arc<Notify>,
+    dbname: String,
+    has_imm: Arc<AtomicBool>, // 是否有 _imm 存在
+    config: DBConfig,
 }
 
 struct DBInner {
     mem: Arc<MemTable>,
-    _imm: Option<Arc<MemTable>>,
+    imm: Option<Arc<MemTable>>,
+    versions: VersionSet,
 }
 
 impl DB {
     fn new() -> Result<Self, DBError> {
+        Self::new_with_name("default_db")
+    }
+
+    fn new_with_name(dbname: &str) -> Result<Self, DBError> {
+        Self::new_with_config(dbname, DBConfig::default())
+    }
+
+    fn new_with_config(dbname: &str, config: DBConfig) -> Result<Self, DBError> {
         let mem = Arc::new(MemTable::new());
-        let (tx, mut rx) = mpsc::channel::<WriteMsg>(CHANNEL_MAX_SIZE);
-
+        let (tx, rx) = mpsc::channel::<WriteMsg>(CHANNEL_MAX_SIZE);
         let last_sequence = Arc::new(Mutex::new(0u64));
-        let snapshot = Arc::clone(&last_sequence);
 
-        let inner = Arc::new(Mutex::new(DBInner { mem, _imm: None }));
-        let inner_write = Arc::clone(&inner);
-        let inner_compaction = Arc::clone(&inner);
+        let inner = Arc::new(Mutex::new(DBInner {
+            mem,
+            imm: None,
+            versions: VersionSet::new(),
+        }));
 
         let db = DB {
-            inner,
+            inner: Arc::clone(&inner),
             tx,
             last_sequence: Arc::clone(&last_sequence),
-            compacting_notify: Arc::new(Notify::new()),
+            switch_notify: Arc::new(Notify::new()),
+            dbname: dbname.to_string(),
+            has_imm: Arc::new(AtomicBool::new(false)),
+            config,
         };
 
-        let notify_notifier = Arc::clone(&db.compacting_notify);
-        let notify_waiting = Arc::clone(&db.compacting_notify);
+        // Start background threads
+        Self::spawn_compaction_thread(
+            dbname.to_string(),
+            Arc::clone(&inner),
+            Arc::clone(&db.switch_notify),
+            Arc::clone(&db.has_imm),
+            db.config.test_disable_compaction,
+        );
 
+        Self::spawn_write_thread(
+            rx,
+            Arc::clone(&inner),
+            Arc::clone(&last_sequence),
+            Arc::clone(&db.switch_notify),
+            Arc::clone(&db.has_imm),
+        );
+
+        Ok(db)
+    }
+
+    fn spawn_compaction_thread(
+        dbname: String,
+        inner: Arc<Mutex<DBInner>>,
+        notify: Arc<Notify>,
+        has_imm: Arc<AtomicBool>,
+        test_disable_compaction: bool,
+    ) {
         std::thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().unwrap();
+            let rt = tokio::runtime::Runtime::new()
+                .expect("Failed to create tokio runtime for compaction thread");
+
             rt.block_on(async move {
                 loop {
-                    notify_waiting.notified().await;
-                    // 这里可以添加 compaction 或 flush 的逻辑
-                    // 例如，检查 _imm 是否存在，如果存在则进行合并或持久化
-                    println!("Compaction signal received");
-                    let guard = inner_compaction.lock().unwrap();
-                    if guard._imm.is_some() {
-                        // 进行合并或持久化
-                        println!("imm still in compaction, waiting...\n");
+                    notify.notified().await;
+                    println!("Switching memtable signal received");
+
+                    if test_disable_compaction {
+                        println!("Compaction disabled, skipping...");
+                        continue;
+                    }
+
+                    if has_imm.load(std::sync::atomic::Ordering::Relaxed) {
+                        println!("Compacting memtable...");
+                        match Self::compact_memtable(&dbname, Arc::clone(&inner)) {
+                            Ok(()) => {
+                                has_imm.store(false, std::sync::atomic::Ordering::Release);
+                                println!("Compaction completed successfully.");
+                                // TODO: remove obsolete files
+                            }
+                            Err(e) => {
+                                eprintln!("Compaction failed: {:?}", e);
+                            }
+                        }
+                    } else {
+                        println!("No _imm to compact.");
                     }
                 }
             });
         });
+    }
 
+    fn spawn_write_thread(
+        mut rx: mpsc::Receiver<WriteMsg>,
+        inner: Arc<Mutex<DBInner>>,
+        last_sequence: Arc<Mutex<SequenceNumber>>,
+        switch_notify: Arc<Notify>,
+        has_imm: Arc<AtomicBool>,
+    ) {
         std::thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().unwrap();
+            let rt = tokio::runtime::Runtime::new()
+                .expect("Failed to create tokio runtime for write thread");
+
             rt.block_on(async move {
-                let mut queue = Vec::new();
+                let mut queue = Vec::with_capacity(BATCH_COMBINE_THRESHOLD);
 
                 loop {
                     let mem_clone = {
-                        let mut guard = inner_write.lock().unwrap();
+                        let mut guard = inner.lock().unwrap();
 
-                        // make room for write
-                        dbg!(guard.mem.aproximate_size());
-                        if guard.mem.aproximate_size() > COMPACTION_MEMORY_THRESHOLD {
-                            dbg!("Compaction triggered, moving memtable to _imm");
-                            if guard._imm.is_none() {
-                                guard._imm = Some(Arc::clone(&guard.mem));
-                                guard.mem = Arc::new(MemTable::new());
-                            }
-                            // notify compaction or flush
-                            // 也许 compaction 正忙?仍然发消息?
-                            notify_notifier.notify_one();
+                        if Self::should_trigger_imm(&guard) {
+                            Self::switch_mem(&mut guard, &switch_notify, &has_imm);
                         }
                         Arc::clone(&guard.mem)
                     };
-                    let mem_ptr = Arc::as_ptr(&mem_clone) as *mut MemTable;
 
+                    // Process write requests
                     tokio::select! {
                         biased;
                         msg = rx.recv() => {
-                            if let Some(msg) = msg {
-                                queue.push(msg);
-                                // 批量收集到阈值或队列空闲
-                                while queue.len() < BATCH_COMBINE_THRESHOLD {
-                                    match rx.try_recv() {
-                                        Ok(next) => queue.push(next),
-                                        Err(_) => break,
-                                    }
+                            match msg {
+                                Some(msg) => {
+                                    Self::process_write_batch(
+                                        msg,
+                                        &mut queue,
+                                        &mut rx,
+                                        &mem_clone,
+                                        &last_sequence,
+                                    ).await;
                                 }
-                                // 一次性处理 queue 里的所有 WriteBatch
-                                dbg!(queue.len());
-                                for msg in queue.drain(..) {
-                                    for (key, value, value_type) in msg.batch.writes {
-                                        let seq = {
-                                            let mut last_seq = snapshot.lock().unwrap();
-                                            *last_seq +=1;
-                                            *last_seq
-                                        };
-                                        unsafe {(*mem_ptr).add(seq, value_type, &key, &value);}
-                                    }
-                                    let _ = msg.resp.send(Ok(()));
+                                None => {
+                                    // Channel closed, perform cleanup and exit
+                                    println!("Write channel closed, shutting down write thread");
+                                    break;
                                 }
-                            } else {
-                                // sender 关闭，安全退出
-                                // TODO: 善后工作
-                                break;
                             }
                         }
                     }
                 }
             });
         });
-        Ok(db)
+    }
+
+    fn should_trigger_imm(guard: &DBInner) -> bool {
+        guard.mem.aproximate_size() > COMPACTION_MEMORY_THRESHOLD && guard.imm.is_none()
+    }
+
+    fn switch_mem(guard: &mut DBInner, notify: &Arc<Notify>, has_imm: &Arc<AtomicBool>) {
+        dbg!("Moving memtable to _imm");
+        guard.imm = Some(Arc::clone(&guard.mem));
+        guard.mem = Arc::new(MemTable::new());
+        has_imm.store(true, std::sync::atomic::Ordering::Release);
+        notify.notify_one();
+    }
+
+    async fn process_write_batch(
+        msg: WriteMsg,
+        queue: &mut Vec<WriteMsg>,
+        rx: &mut mpsc::Receiver<WriteMsg>,
+        mem: &Arc<MemTable>,
+        last_sequence: &Arc<Mutex<SequenceNumber>>,
+    ) {
+        queue.push(msg);
+
+        // Collect additional messages up to threshold
+        while queue.len() < BATCH_COMBINE_THRESHOLD {
+            match rx.try_recv() {
+                Ok(next_msg) => queue.push(next_msg),
+                Err(_) => break,
+            }
+        }
+
+        // Process all batched writes
+        dbg!(queue.len());
+        let mem_ptr = Arc::as_ptr(mem) as *mut MemTable;
+
+        for msg in queue.drain(..) {
+            for (key, value, value_type) in msg.batch.writes {
+                let seq = {
+                    let mut last_seq = last_sequence.lock().unwrap();
+                    *last_seq += 1;
+                    *last_seq
+                };
+                unsafe {
+                    (*mem_ptr).add(seq, value_type, &key, &value);
+                }
+            }
+            let _ = msg.resp.send(Ok(()));
+        }
     }
 
     pub async fn write(
@@ -193,27 +295,153 @@ impl DB {
             *last_seq
         };
 
-        let (mem, _imm) = {
+        let (mem, imm, current) = {
             let inner = self.inner.lock().unwrap();
-            (Arc::clone(&inner.mem), inner._imm.clone())
+            (
+                inner.mem.clone(),
+                inner.imm.clone(),
+                inner.versions.current(),
+            )
         };
-        let try_get = |table: &Arc<MemTable>| table.get(key, snapshot);
 
-        match try_get(&mem) {
-            Ok(Some(value)) => Ok(Some(value)),
-            Ok(None) => {
-                if let Some(imm) = _imm {
-                    match try_get(&imm) {
-                        Ok(Some(value)) => Ok(Some(value)),
-                        Ok(None) => Ok(None), // TODO: 查找 SSTable
-                        Err(e) => Err(e),
-                    }
-                } else {
-                    Ok(None) // TODO: 查找 SSTable
+        // Try memtable first
+        if let Some(value) = mem.get(key, snapshot)? {
+            return Ok(Some(value));
+        }
+
+        // Try immutable memtable if it exists
+        if let Some(imm) = imm {
+            if let Some(value) = imm.get(key, snapshot)? {
+                return Ok(Some(value));
+            }
+        }
+
+        // Try SSTable files if current version exists
+        if let Some(current) = current {
+            let internal_key = InternalKey::new(key, snapshot, VALUE_TYPE_FOR_SEEK, &[]);
+            return current.get(&self.dbname, &internal_key);
+        }
+
+        Ok(None)
+    }
+
+    /// Compacts the immutable memtable to an SSTable file
+    fn compact_memtable(dbname: &str, inner: Arc<Mutex<DBInner>>) -> Result<(), DBError> {
+        use super::version::VersionBuilder;
+
+        let file_path;
+        let mut meta;
+        let iter;
+        let mut new_version: Option<Version> = None;
+
+        // Phase 1: Prepare compaction metadata and iterator
+        {
+            let mut inner_guard = inner.lock().unwrap();
+            assert!(inner_guard.imm.is_some());
+
+            println!("Compacting memtable...");
+            meta = FileMetaData {
+                file_number: inner_guard.versions.next_file_number(),
+                file_size: 0,
+                smallest_key: None,
+                largest_key: None,
+            };
+            file_path = format!("{}-{}.ldb", dbname, meta.file_number);
+            iter = MemTableIter::new(inner_guard.imm.as_ref().unwrap());
+        }
+
+        // Phase 2: Build the SSTable file
+        Self::build_table(&file_path, iter, &mut meta).inspect_err(|_e| {
+            let _ = remove_file(&file_path);
+        })?;
+
+        println!(
+            "Compacted memtable to file: {} (size: {} bytes)",
+            meta.file_number, meta.file_size
+        );
+
+        // Phase 3: Update version information
+        {
+            let mut inner_guard = inner.lock().unwrap();
+            inner_guard.imm = None; // Clear _imm
+
+            let mut edit = VersionEdit::new();
+            if meta.file_size > 0 {
+                let level = inner_guard
+                    .versions
+                    .pick_level_for_memtable_output(&meta.smallest_key, &meta.largest_key);
+                edit.add_file(level, meta);
+            }
+
+            // Apply version edit
+            let mut builder;
+            match inner_guard.versions.current() {
+                Some(current) => {
+                    builder = VersionBuilder::new((*current).clone());
+                }
+                None => {
+                    // If no current version, create a new one
+                    builder = VersionBuilder::new(Version::default());
                 }
             }
-            Err(e) => Err(e),
+            builder.apply(&edit);
+            new_version = Some(builder.build());
+
+            // TODO: Write manifest
         }
+
+        // TODO: Write log
+        // TODO: Set current manifest
+
+        // Phase 4: Install new version
+        {
+            let mut inner_guard = inner.lock().unwrap();
+            if let Some(v) = new_version {
+                inner_guard.versions.append(v);
+            }
+            // TODO: Remove obsolete files
+        }
+
+        Ok(())
+    }
+
+    /// Builds an SSTable file from an iterator
+    /// On error, the caller should delete the file
+    fn build_table(
+        table_file_name: &str,
+        mut iter: impl InternalIterator,
+        meta: &mut FileMetaData,
+    ) -> Result<(), DBError> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(table_file_name)
+            .map_err(DBError::from)?;
+
+        iter.seek_to_first()?;
+
+        if !iter.valid() {
+            // Empty iterator, nothing to build
+            meta.file_size = 0;
+            return Ok(());
+        }
+
+        meta.smallest_key = iter.key().cloned();
+        let mut builder = TableBuilder::new(&mut file);
+        let mut largest_key = None;
+
+        while iter.valid() {
+            let key = iter.key().ok_or(DBError::Corruption)?;
+            largest_key = Some(key.clone());
+            builder.add(key)?;
+            iter.next()?;
+        }
+
+        meta.largest_key = largest_key;
+        meta.file_size = builder.finish()?;
+
+        Ok(())
     }
 }
 
@@ -250,7 +478,6 @@ impl DBIterator {
 
     // Helper method to find the next valid key visible to the user
     fn find_next_valid_key(&mut self, mut skipping: bool) {
-        //assert!(self.valid());
         assert!(self.direction == Direction::Forward);
         loop {
             if let Some(key) = self.iter.key() {
@@ -365,7 +592,7 @@ impl DBIterator {
     }
 
     pub fn next(&mut self) {
-        //assert!(self.valid);
+        assert!(self.valid);
 
         if self.direction == Direction::Reverse {
             // If we were going backwards, switch to forward direction
@@ -840,18 +1067,32 @@ mod tests {
     }
 
     #[test]
-    fn test_db_memtable_to_imm_compaction_trigger() {
+    fn test_mem_to_imm_switch_only() {
         use std::thread;
         use std::time::Duration;
         use tokio::runtime::Runtime;
 
         let rt = Runtime::new().unwrap();
-        let db = DB::new().unwrap();
+        // 创建禁用 compaction 的数据库
+        let mut config = DBConfig::default();
+        config.test_disable_compaction = true;
+        let db = DB::new_with_config("test_db", config).unwrap();
 
         // 写入大量数据，超过 COMPACTION_THRESHOLD，触发 memtable -> imm
         let value = vec![b'x'; 1024]; // 1KB value
         let key_prefix = b"key_";
         let batch_size = COMPACTION_MEMORY_THRESHOLD / 1024 + 10; // 保证超过阈值
+
+        // 检查初始状态
+        {
+            let inner = db.inner.lock().unwrap();
+            assert!(inner.imm.is_none(), "imm should be None initially");
+            assert!(inner.mem.aproximate_size() < COMPACTION_MEMORY_THRESHOLD);
+            assert!(
+                !db.has_imm.load(std::sync::atomic::Ordering::Relaxed),
+                "has_imm should be false initially"
+            );
+        }
 
         rt.block_on(async {
             let mut batch = WriteBatch::new();
@@ -866,44 +1107,306 @@ mod tests {
                 .unwrap();
         });
 
-        // 等待后台线程处理 compaction
-        thread::sleep(Duration::from_millis(200));
+        // 短暂等待，让写入线程处理完毕
+        thread::sleep(Duration::from_millis(50));
 
         {
-            // 检查 imm 是否被正确生成
             let inner = db.inner.lock().unwrap();
+            // 验证 mem 已经切换到 imm
             assert!(
-                inner._imm.is_some(),
-                "imm should be Some after compaction triggered"
+                inner.imm.is_some(),
+                "imm should be Some after memtable switch"
+            );
+            // 验证新的 mem 是空的或者很小
+            assert!(
+                inner.mem.aproximate_size() < COMPACTION_MEMORY_THRESHOLD,
+                "new mem should be small after switch"
+            );
+            // 验证 has_imm 标志
+            assert!(
+                db.has_imm.load(std::sync::atomic::Ordering::Relaxed),
+                "has_imm flag should be true"
             );
         }
 
         // 再写入一条数据，应该写到新的 memtable
         rt.block_on(async {
             let mut batch = WriteBatch::new();
-            batch.put(b"last_key", b"last_value");
+            batch.put(b"new_key", b"new_value");
             db.write(WriteOptions { sync: false }, Some(batch))
                 .await
                 .unwrap();
         });
 
-        // 检查 get 能查到新旧数据
-        assert_eq!(db.get(b"last_key").unwrap(), Some(b"last_value".to_vec()));
-        let mut found = false;
-        for i in 0..batch_size {
+        // 短暂等待处理
+        thread::sleep(Duration::from_millis(10));
+
+        // 验证 imm 仍然存在（因为 compaction 被禁用）
+        {
+            let inner = db.inner.lock().unwrap();
+            assert!(
+                inner.imm.is_some(),
+                "imm should still exist when compaction is disabled"
+            );
+            assert!(
+                db.has_imm.load(std::sync::atomic::Ordering::Relaxed),
+                "has_imm flag should remain true when compaction is disabled"
+            );
+        }
+
+        // 验证数据能够正确读取（从 mem 和 imm）
+        assert_eq!(db.get(b"new_key").unwrap(), Some(b"new_value".to_vec()));
+
+        // 验证至少能找到一个旧的 key（在 imm 中）
+        let mut found_old = false;
+        for i in 0..batch_size.min(5) {
             let mut key = key_prefix.to_vec();
             key.extend_from_slice(i.to_string().as_bytes());
             if db.get(&key).unwrap().is_some() {
-                found = true;
+                found_old = true;
                 break;
             }
         }
-        assert!(found, "Should find at least one old key in mem or imm");
+        assert!(found_old, "Should find at least one old key in imm");
 
-        // 可以打印 imm 的 approximate_size 观察
+        // 打印状态信息
         let inner = db.inner.lock().unwrap();
-        if let Some(ref imm) = inner._imm {
+        if let Some(ref imm) = inner.imm {
             println!("imm approximate_size = {}", imm.aproximate_size());
+        }
+        println!("new mem approximate_size = {}", inner.mem.aproximate_size());
+    }
+
+    #[test]
+    fn test_imm_compaction_to_sst_and_read() {
+        use std::fs;
+        use std::thread;
+        use std::time::Duration;
+        use tokio::runtime::Runtime;
+
+        let rt = Runtime::new().unwrap();
+        let dbname = "test_compaction_db";
+        let db = DB::new_with_name(dbname).unwrap();
+
+        // Write enough data to trigger memtable -> imm switch
+        let value: Vec<u8> = vec![b'x'; 1024]; // 1KB value
+        let key_prefix = b"compact_key_";
+        let batch_size = COMPACTION_MEMORY_THRESHOLD / 1024 + 10; // Ensure threshold is exceeded
+
+        // Phase 1: Write data to trigger imm switch
+        rt.block_on(async {
+            let mut batch = WriteBatch::new();
+            for i in 0..batch_size {
+                let mut key = key_prefix.to_vec();
+                key.extend_from_slice(i.to_string().as_bytes());
+                batch.put(&key, &value);
+            }
+
+            db.write(WriteOptions { sync: false }, Some(batch))
+                .await
+                .unwrap();
+        });
+
+        // Wait for write thread to process and switch memtable (shorter wait)
+        thread::sleep(Duration::from_millis(20));
+
+        // Check if imm exists (it should after memtable switch)
+        let imm_exists = {
+            let inner = db.inner.lock().unwrap();
+            inner.imm.is_some()
+        };
+
+        if imm_exists {
+            println!("imm exists after write, waiting for compaction to complete");
+            // Phase 2: Wait for compaction to complete
+            let mut compaction_completed = false;
+            for i in 0..50 {
+                // Wait up to 5 seconds
+                thread::sleep(Duration::from_millis(100));
+                if !db.has_imm.load(std::sync::atomic::Ordering::Relaxed) {
+                    compaction_completed = true;
+                    println!("Compaction completed after {}ms", (i + 1) * 100);
+                    break;
+                }
+            }
+            assert!(
+                compaction_completed,
+                "Compaction should complete within 5 seconds"
+            );
+        } else {
+            println!("imm already compacted, waiting a bit more to ensure SST file is created");
+            // If imm is already compacted, wait a bit more for file creation
+            thread::sleep(Duration::from_millis(50));
+        }
+
+        // Verify imm is cleared after compaction
+        {
+            let inner = db.inner.lock().unwrap();
+            assert!(
+                inner.imm.is_none(),
+                "imm should be cleared after compaction"
+            );
+        }
+
+        // Phase 3: Verify SST file is created
+        let sst_files: Vec<_> = fs::read_dir(".")
+            .unwrap()
+            .filter_map(|entry| {
+                let entry = entry.ok()?;
+                let path = entry.path();
+                let filename = path.file_name()?.to_str()?;
+                if filename.starts_with(dbname) && filename.ends_with(".ldb") {
+                    Some(filename.to_string())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        assert!(
+            !sst_files.is_empty(),
+            "At least one SST file should be created"
+        );
+        println!("Created SST files: {:?}", sst_files);
+
+        // Phase 4: Verify data can be read from SST files
+        // The data should now be in SST files, not in memory
+        let mut found_keys = 0;
+        for i in 0..batch_size.min(10) {
+            // Test first 10 keys
+            let mut key = key_prefix.to_vec();
+            key.extend_from_slice(i.to_string().as_bytes());
+
+            match db.get(&key) {
+                Ok(Some(retrieved_value)) => {
+                    assert_eq!(
+                        retrieved_value, value,
+                        "Retrieved value should match original"
+                    );
+                    found_keys += 1;
+                }
+                Ok(None) => {
+                    // Key not found, this might be expected in some cases
+                }
+                Err(e) => {
+                    panic!("Error reading key {}: {:?}", i, e);
+                }
+            }
+        }
+
+        assert!(
+            found_keys > 0,
+            "Should find at least some keys in SST files"
+        );
+        println!("Successfully read {} keys from SST files", found_keys);
+
+        // Phase 5: Test that new writes go to new memtable and can be read
+        rt.block_on(async {
+            db.put(b"new_after_compaction", b"new_value").await.unwrap();
+        });
+
+        // This should be readable from the new memtable
+        assert_eq!(
+            db.get(b"new_after_compaction").unwrap(),
+            Some(b"new_value".to_vec()),
+            "New data should be readable from new memtable"
+        );
+
+        // Phase 6: Verify that both old data (from SST) and new data (from mem) are accessible
+        let test_key = format!("{}0", String::from_utf8_lossy(key_prefix));
+        assert_eq!(
+            db.get(test_key.as_bytes()).unwrap(),
+            Some(value.clone()),
+            "Old data should still be accessible from SST"
+        );
+        /*if let Ok(Some(_)) = db.get(test_key.as_bytes()) {
+            println!("Successfully read old data from SST file");
+        }*/
+
+        // Clean up SST files
+        for sst_file in sst_files {
+            let _ = fs::remove_file(sst_file);
+        }
+    }
+
+    #[test]
+    fn test_multiple_memtable_compactions() {
+        use std::fs;
+        use std::thread;
+        use std::time::Duration;
+        use tokio::runtime::Runtime;
+
+        let rt = Runtime::new().unwrap();
+        let dbname = "test_multi_compaction_db";
+        let db = DB::new_with_name(dbname).unwrap();
+
+        // Trigger multiple compactions
+        let value = vec![b'y'; 1024];
+        let batch_size = COMPACTION_MEMORY_THRESHOLD / 1024 + 5;
+
+        for round in 0..3 {
+            rt.block_on(async {
+                let mut batch = WriteBatch::new();
+                for i in 0..batch_size {
+                    let key = format!("round_{}_key_{}", round, i);
+                    batch.put(key.as_bytes(), &value);
+                }
+
+                db.write(WriteOptions { sync: false }, Some(batch))
+                    .await
+                    .unwrap();
+            });
+
+            // Wait for compaction to complete
+            thread::sleep(Duration::from_millis(200));
+
+            // Wait for has_imm to be cleared
+            for _ in 0..30 {
+                if !db.has_imm.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+
+        // Verify we can read data from all rounds
+        let mut total_found = 0;
+        for round in 0..3 {
+            let mut round_found = 0;
+            for i in 0..batch_size.min(3) {
+                let key = format!("round_{}_key_{}", round, i);
+                if let Ok(Some(retrieved_value)) = db.get(key.as_bytes()) {
+                    assert_eq!(retrieved_value, value);
+                    round_found += 1;
+                    total_found += 1;
+                }
+            }
+            println!("Found {} keys from round {}", round_found, round);
+        }
+
+        assert!(
+            total_found > 0,
+            "Should find keys from multiple compaction rounds"
+        );
+        println!("Total keys found across all rounds: {}", total_found);
+
+        // Clean up
+        let sst_files: Vec<_> = fs::read_dir(".")
+            .unwrap()
+            .filter_map(|entry| {
+                let entry = entry.ok()?;
+                let path = entry.path();
+                let filename = path.file_name()?.to_str()?;
+                if filename.starts_with(dbname) && filename.ends_with(".ldb") {
+                    Some(filename.to_string())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        for sst_file in sst_files {
+            let _ = fs::remove_file(sst_file);
         }
     }
 }

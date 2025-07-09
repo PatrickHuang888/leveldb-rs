@@ -1,5 +1,5 @@
 use super::table::BlockHandle;
-use crate::Options;
+use crate::DBConfig;
 use crate::db::InternalIterator;
 use crate::db::InternalKey;
 use crate::{DBError, util};
@@ -63,11 +63,11 @@ pub struct BlockBuilder {
     restarts: Vec<u32>,
     counter: usize,
     last_key: Vec<u8>,
-    options: crate::Options,
+    options: crate::DBConfig,
 }
 
 impl BlockBuilder {
-    pub fn new(options: Options) -> Self {
+    pub fn new(options: DBConfig) -> Self {
         let restarts = vec![0];
         BlockBuilder {
             buffer: Vec::new(),
@@ -424,7 +424,7 @@ impl InternalIterator for BlockIter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Options;
+    use crate::DBConfig;
     use crate::db::InternalKey;
     use crate::db::dbformat::MAX_SEQUENCE_NUMBER;
     use crate::db::dbformat::ValueType;
@@ -435,7 +435,7 @@ mod tests {
 
     #[test]
     fn test_blockiter_seek_prev_next_combo() {
-        let mut opts = Options::default();
+        let mut opts = DBConfig::default();
         opts.block_restart_interval = 2;
         let mut builder = BlockBuilder::new(opts.clone());
         let keys: Vec<&[u8]> = vec![b"a", b"c", b"e", b"g"];
@@ -487,7 +487,7 @@ mod tests {
     /// 正常 block 构建、正序/逆序遍历、seek、边界 seek 行为的回归测试
     #[test]
     fn test_blockbuilder_and_block_roundtrip() {
-        let mut opts = Options::default();
+        let mut opts = DBConfig::default();
         opts.block_restart_interval = 2;
         let mut builder = BlockBuilder::new(opts.clone());
         let keys: Vec<&[u8]> = vec![b"a" as &[u8], b"ab", b"abc", b"b", b"c"];
@@ -607,7 +607,7 @@ mod tests {
     /// 空 block 的行为，iter 应 invalid
     #[test]
     fn test_blockbuilder_empty() {
-        let opts = Options::default();
+        let opts = DBConfig::default();
         let builder = BlockBuilder::new(opts);
         assert!(builder.is_empty());
         let data = builder.finish();
@@ -619,7 +619,7 @@ mod tests {
     /// 只有一个 entry 且为 restart 点，测试 next/prev/seek 边界
     #[test]
     fn test_blockbuilder_single_entry_restart() {
-        let opts = Options {
+        let opts = DBConfig {
             block_restart_interval: 16,
             ..Default::default()
         };
@@ -644,7 +644,7 @@ mod tests {
     /// 所有 entry 都是 restart 点（block_restart_interval=1），测试遍历
     #[test]
     fn test_blockbuilder_all_restart_points() {
-        let opts = Options {
+        let opts = DBConfig {
             block_restart_interval: 1,
             ..Default::default()
         };
@@ -674,7 +674,7 @@ mod tests {
     /// key 为空、value 为空的 entry，测试遍历和内容
     #[test]
     fn test_blockbuilder_empty_key_and_value() {
-        let opts = Options {
+        let opts = DBConfig {
             block_restart_interval: 2,
             ..Default::default()
         };
@@ -699,7 +699,7 @@ mod tests {
     /// 极端长 key/value，测试大数据 entry 的正确性
     #[test]
     fn test_blockbuilder_long_key_value() {
-        let opts = Options {
+        let opts = DBConfig {
             block_restart_interval: 2,
             ..Default::default()
         };
@@ -720,7 +720,7 @@ mod tests {
     /// 重复 user_key 但 seq 不同，测试 entry 顺序和内容
     #[test]
     fn test_blockbuilder_duplicate_user_key_diff_seq() {
-        let opts = Options {
+        let opts = DBConfig {
             block_restart_interval: 2,
             ..Default::default()
         };
@@ -745,7 +745,7 @@ mod tests {
     /// seek 到正好等于 restart 点的 key，测试定位准确性
     #[test]
     fn test_blockbuilder_seek_restart_point() {
-        let opts = Options {
+        let opts = DBConfig {
             block_restart_interval: 2,
             ..Default::default()
         };
@@ -773,7 +773,7 @@ mod tests {
     /// block_restart_interval 恰好等于 entry 数，测试首尾遍历
     #[test]
     fn test_blockbuilder_restart_interval_eq_entry_count() {
-        let opts = Options {
+        let opts = DBConfig {
             block_restart_interval: 4,
             ..Default::default()
         };

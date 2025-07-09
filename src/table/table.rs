@@ -34,8 +34,8 @@ index_block 里的 key 是“data block 的分割 key”，即大于等于该 da
 且小于下一个 data block 第一个 uesr_key的最短 key，
 并且尽量短。value 是对应 data block 的 BlockHandle（即 offset+size）。
 */
-
 use crate::DBError;
+use crate::db::dbformat::ValueType;
 use crate::db::{InternalIterator, InternalKey};
 use crate::table::block::BlockIter;
 use crate::table::block::{Block, BlockBuilder};
@@ -171,8 +171,8 @@ impl<W: Write + Seek> TableBuilder<W> {
         Ok(handle)
     }
 
-    /// 写入所有元数据和 Footer
-    pub fn finish(mut self) -> Result<(), DBError> {
+    /// 写入所有元数据和 Footer, 返回 table 的总长度
+    pub fn finish(mut self) -> Result<u64, DBError> {
         self.flush_block()?;
         // 最后一个 block 的 index entry
         if let Some((last_max_key, last_handle)) = self.pending_index_entry.take() {
@@ -195,7 +195,8 @@ impl<W: Write + Seek> TableBuilder<W> {
         let mut footer_bytes = Vec::new();
         footer.encode_to(&mut footer_bytes);
         self.writer.write_all(&footer_bytes)?;
-        Ok(())
+        self.offset += footer_bytes.len() as u64;
+        Ok(self.offset)
     }
 }
 
@@ -229,6 +230,34 @@ impl<R: Read + Seek> Table<R> {
         let mut buf = vec![0u8; handle.size as usize];
         reader.read_exact(&mut buf)?;
         Ok(Block::new(buf))
+    }
+
+    pub fn get(&mut self, key: &InternalKey) -> Result<Option<InternalKey>, DBError> {
+        // 使用 index_block 查找对应的 data block
+        let mut index_iter = BlockIter::new(self.index_block.clone());
+        index_iter.seek(key)?;
+        if !index_iter.valid() {
+            return Ok(None);
+        }
+        let handle_bytes = index_iter
+            .key()
+            .as_ref()
+            .ok_or(DBError::Corruption)?
+            .value();
+        let mut handle_slice = handle_bytes;
+        let (handle, _) = BlockHandle::decode_from(&mut handle_slice).ok_or(DBError::Corruption)?;
+        // 读取对应的 data block
+        let data_block = Table::read_block(&mut self.reader, &handle)?;
+        // 在 data block 中查找 key
+        let mut data_iter = BlockIter::new(data_block);
+        data_iter.seek(key)?;
+        if data_iter.valid() {
+            let ikey = data_iter.key().unwrap();
+            if ikey.user_key() == key.user_key() {
+                return Ok(Some(ikey.clone()));
+            }
+        }
+        Ok(None)
     }
     // 可扩展：查找 key、读取 filter block、metaindex block 等
 }

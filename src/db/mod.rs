@@ -11,6 +11,7 @@ mod db_impl;
 pub(crate) mod dbformat;
 pub(crate) mod memtable;
 mod skiplist;
+mod version;
 
 pub(super) trait InternalIterator {
     fn seek(&mut self, key: &InternalKey) -> Result<(), DBError>;

@@ -16,7 +16,7 @@ enum CompressionType {
 }
 
 #[derive(Clone)]
-pub struct Options {
+pub struct DBConfig {
     // Compress blocks using the specified compression algorithm.  This
     // parameter can be changed dynamically.
     //
@@ -42,14 +42,17 @@ pub struct Options {
     // actual size of the unit read from disk may be smaller if
     // compression is enabled.  This parameter can be changed dynamically.
     pub block_size: usize,
+
+    pub test_disable_compaction: bool,
 }
 
-impl Default for Options {
+impl Default for DBConfig {
     fn default() -> Self {
-        Options {
+        DBConfig {
             block_restart_interval: 16,
             block_size: 4096,
             compression: CompressionType::SNAPPY_COMPRESSION,
+            test_disable_compaction: false,
         }
     }
 }

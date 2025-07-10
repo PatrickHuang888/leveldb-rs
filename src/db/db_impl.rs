@@ -244,9 +244,9 @@ impl DB {
         for msg in queue.drain(..) {
             for (key, value, value_type) in msg.batch.writes {
                 let seq = {
-                    let mut last_seq = last_sequence.lock().unwrap();
-                    *last_seq += 1;
-                    *last_seq
+                    let mut lastSeq = last_sequence.lock().unwrap();
+                    *lastSeq += 1;
+                    *lastSeq
                 };
                 unsafe {
                     (*mem_ptr).add(seq, value_type, &key, &value);
@@ -461,10 +461,7 @@ enum Direction {
 }
 
 impl DBIterator {
-    pub fn new(
-        iterators: Vec<Rc<RefCell<dyn InternalIterator>>>,
-        snapshot: SequenceNumber,
-    ) -> Self {
+    pub fn new(iterators: Vec<Box<dyn InternalIterator>>, snapshot: SequenceNumber) -> Self {
         let iter = MergingIterator::new(iterators);
         DBIterator {
             snapshot,
@@ -719,27 +716,27 @@ impl DBIterator {
 }
 
 struct MergingIterator {
-    iterators: Vec<Rc<RefCell<dyn InternalIterator>>>,
-    current: Option<Rc<RefCell<dyn InternalIterator>>>,
+    iterators: Vec<Box<dyn InternalIterator>>,
+    current_index: Option<usize>,
     direction: Direction,
 }
 
 impl MergingIterator {
-    pub fn new(iterators: Vec<Rc<RefCell<dyn InternalIterator>>>) -> Self {
+    pub fn new(iterators: Vec<Box<dyn InternalIterator>>) -> Self {
         MergingIterator {
             iterators,
-            current: None,
+            current_index: None,
             direction: Direction::Forward,
         }
     }
 
     pub fn valid(&self) -> bool {
-        self.current.is_some()
+        self.current_index.is_some()
     }
 
     pub fn seek_to_first(&mut self) -> Result<(), DBError> {
-        for iter in &self.iterators {
-            iter.borrow_mut().seek_to_first()?;
+        for iter in &mut self.iterators {
+            iter.seek_to_first()?;
         }
         self.find_smallest();
         self.direction = Direction::Forward;
@@ -747,32 +744,31 @@ impl MergingIterator {
     }
 
     fn find_smallest(&mut self) {
-        let mut smallest: Option<Rc<RefCell<dyn InternalIterator>>> = None;
-        for iter in &self.iterators {
-            let iter_borrow = iter.borrow();
-            if let Some(key) = iter_borrow.key() {
-                let is_smaller = match &smallest {
-                    None => true,
-                    Some(smallest_iter) => {
-                        let smallest_borrow = smallest_iter.borrow();
-                        if let Some(smallest_key) = smallest_borrow.key() {
-                            key < smallest_key
-                        } else {
-                            false
+        let mut smallest_index: Option<usize> = None;
+        let mut smallest_key: Option<InternalKey> = None;
+
+        for (index, iter) in self.iterators.iter().enumerate() {
+            if let Some(key) = iter.key() {
+                match &smallest_key {
+                    None => {
+                        smallest_index = Some(index);
+                        smallest_key = Some(key.clone());
+                    }
+                    Some(current_smallest) => {
+                        if key < current_smallest {
+                            smallest_index = Some(index);
+                            smallest_key = Some(key.clone());
                         }
                     }
-                };
-                if is_smaller {
-                    smallest = Some(iter.clone());
                 }
             }
         }
-        self.current = smallest;
+        self.current_index = smallest_index;
     }
 
     pub fn seek_to_last(&mut self) -> Result<(), DBError> {
-        for iter in &self.iterators {
-            iter.borrow_mut().seek_to_last()?;
+        for iter in &mut self.iterators {
+            iter.seek_to_last()?;
         }
         self.find_largest();
         self.direction = Direction::Reverse;
@@ -780,57 +776,55 @@ impl MergingIterator {
     }
 
     fn find_largest(&mut self) {
-        let mut largest: Option<Rc<RefCell<dyn InternalIterator>>> = None;
-        for iter in &self.iterators {
-            let iter_borrow = iter.borrow();
-            if let Some(key) = iter_borrow.key() {
-                let is_larger = match &largest {
-                    None => true,
-                    Some(largest_iter) => {
-                        let largest_borrow = largest_iter.borrow();
-                        if let Some(largest_key) = largest_borrow.key() {
-                            key > largest_key
-                        } else {
-                            false
+        let mut largest_index: Option<usize> = None;
+        let mut largest_key: Option<InternalKey> = None;
+
+        for (index, iter) in self.iterators.iter().enumerate() {
+            if let Some(key) = iter.key() {
+                match &largest_key {
+                    None => {
+                        largest_index = Some(index);
+                        largest_key = Some(key.clone());
+                    }
+                    Some(current_largest) => {
+                        if key > current_largest {
+                            largest_index = Some(index);
+                            largest_key = Some(key.clone());
                         }
                     }
-                };
-                if is_larger {
-                    largest = Some(iter.clone());
                 }
             }
         }
-        self.current = largest;
+        self.current_index = largest_index;
     }
 
     pub fn seek(&mut self, key: &InternalKey) -> Result<(), DBError> {
         self.direction = Direction::Forward;
         for iter in &mut self.iterators {
-            iter.borrow_mut().seek(key)?;
+            iter.seek(key)?;
         }
         self.find_smallest();
         Ok(())
     }
 
     pub fn key(&self) -> Option<InternalKey> {
-        self.current.as_ref().and_then(|iter| {
-            let iter_borrow = iter.borrow();
-            iter_borrow.key().cloned()
-        })
+        self.current_index
+            .and_then(|index| self.iterators[index].key().cloned())
     }
 
     pub fn next(&mut self) -> Result<(), DBError> {
         if self.direction != Direction::Forward {
             // Ensure that all children are positioned after key()
-            if let Some(current) = &self.current {
+            if let Some(current_index) = self.current_index {
                 let key = self.key();
-                for iter in &mut self.iterators {
-                    if !Rc::ptr_eq(iter, current) {
+                for (index, iter) in self.iterators.iter_mut().enumerate() {
+                    if index != current_index {
                         if let Some(ref k) = key {
-                            iter.borrow_mut().seek(k)?;
+                            iter.seek(k)?; // Direct method call - no borrow checking
                         }
-                        if iter.borrow().valid() && (key == iter.borrow().key().cloned()) {
-                            iter.borrow_mut().next()?;
+                        let should_advance = iter.valid() && (key == iter.key().cloned());
+                        if should_advance {
+                            iter.next()?; // Direct method call - no borrow checking
                         }
                     }
                 }
@@ -838,8 +832,8 @@ impl MergingIterator {
             self.direction = Direction::Forward;
         }
 
-        if let Some(current) = &self.current {
-            current.borrow_mut().next()?;
+        if let Some(current_index) = self.current_index {
+            self.iterators[current_index].next()?; // Direct method call - safe
         }
         self.find_smallest();
         Ok(())
@@ -848,18 +842,19 @@ impl MergingIterator {
     pub fn prev(&mut self) -> Result<(), DBError> {
         if self.direction != Direction::Reverse {
             // Ensure that all children are positioned before key()
-            if let Some(current) = &self.current {
+            if let Some(current_index) = self.current_index {
                 let key = self.key();
-                for iter in &mut self.iterators {
-                    if !Rc::ptr_eq(iter, current) {
+                for (index, iter) in self.iterators.iter_mut().enumerate() {
+                    if index != current_index {
                         if let Some(ref k) = key {
-                            iter.borrow_mut().seek(k)?;
+                            iter.seek(k)?;
                         }
-                        if iter.borrow().valid() {
-                            iter.borrow_mut().prev()?;
+                        let is_valid = iter.valid();
+                        if is_valid {
+                            iter.prev()?;
                         } else {
                             // has no entries >= key().  Position at last entry.
-                            iter.borrow_mut().seek_to_last()?;
+                            iter.seek_to_last()?;
                         }
                     }
                 }
@@ -867,8 +862,8 @@ impl MergingIterator {
             self.direction = Direction::Reverse;
         }
 
-        if let Some(current) = &self.current {
-            current.borrow_mut().prev()?;
+        if let Some(current_index) = self.current_index {
+            self.iterators[current_index].prev()?;
         }
         self.find_largest();
         Ok(())
@@ -940,7 +935,7 @@ mod tests {
         // 正向遍历
         let mem = Arc::clone(&db.inner.lock().unwrap().mem);
         let mut iter = DBIterator::new(
-            vec![Rc::new(RefCell::new(MemTableIter::new(&mem)))],
+            vec![Box::new(MemTableIter::new(&mem))],
             MAX_SEQUENCE_NUMBER, // 使用当前的 sequence number
         );
         iter.seek_to_first();
@@ -956,7 +951,7 @@ mod tests {
 
         // 反向遍历
         let mut iter = DBIterator::new(
-            vec![Rc::new(RefCell::new(MemTableIter::new(&mem)))],
+            vec![Box::new(MemTableIter::new(&mem))],
             MAX_SEQUENCE_NUMBER, // 使用当前的 sequence number
         );
         iter.seek_to_last();
@@ -974,7 +969,7 @@ mod tests {
 
         // seek 到 b
         let mut iter = DBIterator::new(
-            vec![Rc::new(RefCell::new(MemTableIter::new(&mem)))],
+            vec![Box::new(MemTableIter::new(&mem))],
             MAX_SEQUENCE_NUMBER, // 使用当前的 sequence number
         );
         iter.seek(b"b");
@@ -1008,8 +1003,8 @@ mod tests {
         let mem1 = Arc::new(mem1);
         let mem2 = Arc::new(mem2);
         // 构造 MergeIterator
-        let iter1 = Rc::new(RefCell::new(MemTableIter::new(&mem1)));
-        let iter2 = Rc::new(RefCell::new(MemTableIter::new(&mem2)));
+        let iter1 = Box::new(MemTableIter::new(&mem1));
+        let iter2 = Box::new(MemTableIter::new(&mem2));
         let mut merge_iter = MergingIterator::new(vec![iter1, iter2]);
         // 正向遍历
         merge_iter.seek_to_first();

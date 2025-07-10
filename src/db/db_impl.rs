@@ -447,7 +447,7 @@ impl DB {
 
 pub struct DBIterator {
     snapshot: SequenceNumber,
-    iter: MergeIterator,
+    iter: MergingIterator,
     valid: bool,
     saved_user_key: Vec<u8>,
     saved_value: Vec<u8>,
@@ -465,7 +465,7 @@ impl DBIterator {
         iterators: Vec<Rc<RefCell<dyn InternalIterator>>>,
         snapshot: SequenceNumber,
     ) -> Self {
-        let iter = MergeIterator::new(iterators);
+        let iter = MergingIterator::new(iterators);
         DBIterator {
             snapshot,
             iter,
@@ -477,7 +477,7 @@ impl DBIterator {
     }
 
     // Helper method to find the next valid key visible to the user
-    fn find_next_valid_key(&mut self, mut skipping: bool) {
+    fn find_next_valid_key(&mut self, mut skipping: bool) -> Result<(), DBError> {
         assert!(self.direction == Direction::Forward);
         loop {
             if let Some(key) = self.iter.key() {
@@ -497,24 +497,26 @@ impl DBIterator {
                             } else {
                                 self.valid = true;
                                 self.saved_user_key.clear();
-                                return;
+                                return Ok(());
                             }
                         }
                         _ => panic!("invalid value type"),
                     }
                 }
             }
-            self.next();
+            self.next().inspect_err(|_e| {
+                self.valid = false;
+            })?;
             if !self.valid() {
                 break;
             }
         }
         self.valid = false;
-        self.saved_user_key.clear();
+        Ok(())
     }
 
     // Helper method to find the previous valid key visible to the user
-    fn find_prev_valid_key(&mut self) {
+    fn find_prev_valid_key(&mut self) -> Result<(), DBError> {
         assert!(self.direction == Direction::Reverse);
 
         let mut value_type = ValueType::TypeDeletion;
@@ -543,55 +545,68 @@ impl DBIterator {
                     }
                 }
             }
-            self.iter.prev();
+            self.iter.prev().inspect_err(|_e| {
+                self.valid = false;
+            })?;
         }
 
         if value_type == ValueType::TypeDeletion {
             // If we reach here, it means we didn't find any valid key
             self.valid = false;
-            self.saved_user_key.clear();
-            self.saved_value.clear();
-            self.direction = Direction::Forward;
         } else {
             self.valid = true;
         }
+        Ok(())
     }
 
-    pub fn seek_to_first(&mut self) {
+    pub fn seek_to_first(&mut self) -> Result<(), DBError> {
         self.direction = Direction::Forward;
         self.saved_value.clear();
-        self.iter.seek_to_first();
+        self.iter
+            .seek_to_first()
+            .inspect_err(|_e| self.valid = false)?;
         if self.iter.valid() {
-            self.find_next_valid_key(false);
+            self.find_next_valid_key(false).inspect_err(|_e| {
+                self.valid = false;
+            })?;
         } else {
             self.valid = false;
-            self.saved_user_key.clear();
         }
+        Ok(())
     }
 
-    pub fn seek_to_last(&mut self) {
+    pub fn seek_to_last(&mut self) -> Result<(), DBError> {
         self.direction = Direction::Reverse;
         self.saved_value.clear();
-        self.iter.seek_to_last();
-        self.find_prev_valid_key();
+        self.iter.seek_to_last().inspect_err(|_e| {
+            self.valid = false;
+        })?;
+        self.find_prev_valid_key().inspect_err(|_e| {
+            self.valid = false;
+        })?;
+        Ok(())
     }
 
-    pub fn seek(&mut self, user_key: &[u8]) {
+    pub fn seek(&mut self, user_key: &[u8]) -> Result<(), DBError> {
         self.direction = Direction::Forward;
         self.saved_value.clear();
         self.saved_user_key.clear();
         self.saved_user_key.extend_from_slice(user_key);
         let ikey = InternalKey::new(user_key, self.snapshot, ValueType::TypeValue, &[]);
-        self.iter.seek(&ikey);
+        self.iter.seek(&ikey).inspect_err(|_e| {
+            self.valid = false;
+        })?;
         if self.iter.valid() {
-            self.find_next_valid_key(false);
+            self.find_next_valid_key(false).inspect_err(|_e| {
+                self.valid = false;
+            })?;
         } else {
             self.valid = false;
-            self.saved_user_key.clear();
         }
+        Ok(())
     }
 
-    pub fn next(&mut self) {
+    pub fn next(&mut self) -> Result<(), DBError> {
         assert!(self.valid);
 
         if self.direction == Direction::Reverse {
@@ -599,15 +614,18 @@ impl DBIterator {
             self.direction = Direction::Forward;
 
             if self.iter.valid() {
-                self.iter.next();
+                self.iter.next().inspect_err(|_e| {
+                    self.valid = false;
+                })?;
             } else {
-                self.iter.seek_to_first();
+                self.iter.seek_to_first().inspect_err(|_e| {
+                    self.valid = false;
+                })?;
             }
 
             if !self.iter.valid() {
-                self.saved_user_key.clear();
                 self.valid = false;
-                return;
+                return Ok(());
             }
         } else {
             // Save current key before moving forward
@@ -616,20 +634,24 @@ impl DBIterator {
             }
 
             // Move to next key
-            self.iter.next();
+            self.iter.next().inspect_err(|_e| {
+                self.valid = false;
+            })?;
 
             // If iterator is no longer valid, clear saved key and set valid to false
             if !self.iter.valid() {
-                self.saved_user_key.clear();
                 self.valid = false;
-                return;
+                return Ok(());
             }
         }
 
-        self.find_next_valid_key(true);
+        self.find_next_valid_key(true).inspect_err(|_e| {
+            self.valid = false;
+        })?;
+        Ok(())
     }
 
-    pub fn prev(&mut self) {
+    pub fn prev(&mut self) -> Result<(), DBError> {
         assert!(self.valid);
 
         if self.direction == Direction::Forward {
@@ -642,13 +664,13 @@ impl DBIterator {
             }
             // Move backwards until we find a key less than saved_key
             loop {
-                self.iter.prev();
+                self.iter.prev().inspect_err(|_e| {
+                    self.valid = false;
+                })?;
 
                 if !self.iter.valid() {
                     self.valid = false;
-                    self.saved_user_key.clear();
-                    self.saved_value.clear();
-                    return;
+                    return Ok(());
                 }
 
                 // Both saved_key and current key must exist at this point
@@ -661,39 +683,50 @@ impl DBIterator {
             self.direction = Direction::Reverse;
         }
 
-        self.find_prev_valid_key();
+        self.find_prev_valid_key().inspect_err(|_e| {
+            self.valid = false;
+        })?;
+        Ok(())
     }
 
     pub fn valid(&self) -> bool {
         self.valid
     }
 
-    pub fn key(&self) -> Option<Vec<u8>> {
+    /// 使用前确定 iterator valid
+    pub fn key(&self) -> Vec<u8> {
         if self.direction == Direction::Forward {
-            self.iter.key().map(|k| k.user_key().to_vec())
+            match self.iter.key() {
+                Some(key) => key.user_key().to_vec(),
+                None => vec![],
+            }
         } else {
-            Some(self.saved_user_key.clone())
+            self.saved_user_key.clone()
         }
     }
 
-    pub fn value(&self) -> Option<Vec<u8>> {
+    /// 使用前确定 iterator valid
+    pub fn value(&self) -> Vec<u8> {
         if self.direction == Direction::Forward {
-            self.iter.key().map(|k| k.value().to_vec())
+            match self.iter.key() {
+                Some(key) => key.value().to_vec(),
+                None => vec![],
+            }
         } else {
-            Some(self.saved_value.clone())
+            self.saved_value.clone()
         }
     }
 }
 
-struct MergeIterator {
+struct MergingIterator {
     iterators: Vec<Rc<RefCell<dyn InternalIterator>>>,
     current: Option<Rc<RefCell<dyn InternalIterator>>>,
     direction: Direction,
 }
 
-impl MergeIterator {
+impl MergingIterator {
     pub fn new(iterators: Vec<Rc<RefCell<dyn InternalIterator>>>) -> Self {
-        MergeIterator {
+        MergingIterator {
             iterators,
             current: None,
             direction: Direction::Forward,
@@ -704,12 +737,13 @@ impl MergeIterator {
         self.current.is_some()
     }
 
-    pub fn seek_to_first(&mut self) {
+    pub fn seek_to_first(&mut self) -> Result<(), DBError> {
         for iter in &self.iterators {
-            iter.borrow_mut().seek_to_first();
+            iter.borrow_mut().seek_to_first()?;
         }
         self.find_smallest();
         self.direction = Direction::Forward;
+        Ok(())
     }
 
     fn find_smallest(&mut self) {
@@ -736,12 +770,13 @@ impl MergeIterator {
         self.current = smallest;
     }
 
-    pub fn seek_to_last(&mut self) {
+    pub fn seek_to_last(&mut self) -> Result<(), DBError> {
         for iter in &self.iterators {
-            iter.borrow_mut().seek_to_last();
+            iter.borrow_mut().seek_to_last()?;
         }
         self.find_largest();
         self.direction = Direction::Reverse;
+        Ok(())
     }
 
     fn find_largest(&mut self) {
@@ -768,12 +803,13 @@ impl MergeIterator {
         self.current = largest;
     }
 
-    pub fn seek(&mut self, key: &InternalKey) {
+    pub fn seek(&mut self, key: &InternalKey) -> Result<(), DBError> {
         self.direction = Direction::Forward;
         for iter in &mut self.iterators {
-            iter.borrow_mut().seek(key);
+            iter.borrow_mut().seek(key)?;
         }
         self.find_smallest();
+        Ok(())
     }
 
     pub fn key(&self) -> Option<InternalKey> {
@@ -783,7 +819,7 @@ impl MergeIterator {
         })
     }
 
-    pub fn next(&mut self) {
+    pub fn next(&mut self) -> Result<(), DBError> {
         if self.direction != Direction::Forward {
             // Ensure that all children are positioned after key()
             if let Some(current) = &self.current {
@@ -791,10 +827,10 @@ impl MergeIterator {
                 for iter in &mut self.iterators {
                     if !Rc::ptr_eq(iter, current) {
                         if let Some(ref k) = key {
-                            iter.borrow_mut().seek(k);
+                            iter.borrow_mut().seek(k)?;
                         }
                         if iter.borrow().valid() && (key == iter.borrow().key().cloned()) {
-                            iter.borrow_mut().next();
+                            iter.borrow_mut().next()?;
                         }
                     }
                 }
@@ -803,12 +839,13 @@ impl MergeIterator {
         }
 
         if let Some(current) = &self.current {
-            current.borrow_mut().next();
+            current.borrow_mut().next()?;
         }
         self.find_smallest();
+        Ok(())
     }
 
-    pub fn prev(&mut self) {
+    pub fn prev(&mut self) -> Result<(), DBError> {
         if self.direction != Direction::Reverse {
             // Ensure that all children are positioned before key()
             if let Some(current) = &self.current {
@@ -816,13 +853,13 @@ impl MergeIterator {
                 for iter in &mut self.iterators {
                     if !Rc::ptr_eq(iter, current) {
                         if let Some(ref k) = key {
-                            iter.borrow_mut().seek(k);
+                            iter.borrow_mut().seek(k)?;
                         }
                         if iter.borrow().valid() {
-                            iter.borrow_mut().prev();
+                            iter.borrow_mut().prev()?;
                         } else {
                             // has no entries >= key().  Position at last entry.
-                            iter.borrow_mut().seek_to_last();
+                            iter.borrow_mut().seek_to_last()?;
                         }
                     }
                 }
@@ -831,13 +868,15 @@ impl MergeIterator {
         }
 
         if let Some(current) = &self.current {
-            current.borrow_mut().prev();
+            current.borrow_mut().prev()?;
         }
         self.find_largest();
+        Ok(())
     }
 }
 
 #[cfg(test)]
+#[allow(warnings)]
 mod tests {
     use crate::db::dbformat::MAX_SEQUENCE_NUMBER;
 
@@ -908,8 +947,8 @@ mod tests {
         let mut keys = Vec::new();
         let mut values = Vec::new();
         while iter.valid() {
-            keys.push(iter.key().unwrap().to_vec());
-            values.push(iter.value().unwrap().to_vec());
+            keys.push(iter.key().to_vec());
+            values.push(iter.value().to_vec());
             iter.next();
         }
         assert_eq!(keys, vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]);
@@ -924,8 +963,8 @@ mod tests {
         let mut rev_keys = Vec::new();
         let mut rev_values = Vec::new();
         while iter.valid() {
-            rev_keys.push(iter.key().unwrap().to_vec());
-            rev_values.push(iter.value().unwrap().to_vec());
+            rev_keys.push(iter.key().to_vec());
+            rev_values.push(iter.value().to_vec());
             iter.prev();
         }
         assert_eq!(
@@ -940,16 +979,16 @@ mod tests {
         );
         iter.seek(b"b");
         assert!(iter.valid());
-        assert_eq!(iter.key().unwrap(), b"b");
-        assert_eq!(iter.value().unwrap(), b"2");
+        assert_eq!(iter.key(), b"b");
+        assert_eq!(iter.value(), b"2");
         // next
         iter.next();
         assert!(iter.valid());
-        assert_eq!(iter.key().unwrap(), b"c");
+        assert_eq!(iter.key(), b"c");
         // prev
         iter.prev();
         assert!(iter.valid());
-        assert_eq!(iter.key().unwrap(), b"b");
+        assert_eq!(iter.key(), b"b");
     }
 
     #[test]
@@ -971,7 +1010,7 @@ mod tests {
         // 构造 MergeIterator
         let iter1 = Rc::new(RefCell::new(MemTableIter::new(&mem1)));
         let iter2 = Rc::new(RefCell::new(MemTableIter::new(&mem2)));
-        let mut merge_iter = MergeIterator::new(vec![iter1, iter2]);
+        let mut merge_iter = MergingIterator::new(vec![iter1, iter2]);
         // 正向遍历
         merge_iter.seek_to_first();
         let mut keys = Vec::new();

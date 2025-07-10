@@ -50,10 +50,9 @@ struct WriteMsg {
     resp: oneshot::Sender<Result<(), DBError>>,
 }
 
-struct DB {
+pub struct DB {
     inner: Arc<Mutex<DBInner>>,
     tx: mpsc::Sender<WriteMsg>,
-    last_sequence: Arc<Mutex<SequenceNumber>>,
     switch_notify: Arc<Notify>,
     dbname: String,
     has_imm: Arc<AtomicBool>, // 是否有 _imm 存在
@@ -64,6 +63,7 @@ struct DBInner {
     mem: Arc<MemTable>,
     imm: Option<Arc<MemTable>>,
     versions: VersionSet,
+    last_sequence: SequenceNumber,
 }
 
 impl DB {
@@ -78,18 +78,17 @@ impl DB {
     fn new_with_config(dbname: &str, config: DBConfig) -> Result<Self, DBError> {
         let mem = Arc::new(MemTable::new());
         let (tx, rx) = mpsc::channel::<WriteMsg>(CHANNEL_MAX_SIZE);
-        let last_sequence = Arc::new(Mutex::new(0u64));
 
         let inner = Arc::new(Mutex::new(DBInner {
             mem,
             imm: None,
             versions: VersionSet::new(),
+            last_sequence: 0,
         }));
 
         let db = DB {
             inner: Arc::clone(&inner),
             tx,
-            last_sequence: Arc::clone(&last_sequence),
             switch_notify: Arc::new(Notify::new()),
             dbname: dbname.to_string(),
             has_imm: Arc::new(AtomicBool::new(false)),
@@ -108,7 +107,6 @@ impl DB {
         Self::spawn_write_thread(
             rx,
             Arc::clone(&inner),
-            Arc::clone(&last_sequence),
             Arc::clone(&db.switch_notify),
             Arc::clone(&db.has_imm),
         );
@@ -160,7 +158,6 @@ impl DB {
     fn spawn_write_thread(
         mut rx: mpsc::Receiver<WriteMsg>,
         inner: Arc<Mutex<DBInner>>,
-        last_sequence: Arc<Mutex<SequenceNumber>>,
         switch_notify: Arc<Notify>,
         has_imm: Arc<AtomicBool>,
     ) {
@@ -172,14 +169,12 @@ impl DB {
                 let mut queue = Vec::with_capacity(BATCH_COMBINE_THRESHOLD);
 
                 loop {
-                    let mem_clone = {
+                    {
                         let mut guard = inner.lock().unwrap();
-
                         if Self::should_trigger_imm(&guard) {
                             Self::switch_mem(&mut guard, &switch_notify, &has_imm);
                         }
-                        Arc::clone(&guard.mem)
-                    };
+                    }
 
                     // Process write requests
                     tokio::select! {
@@ -191,8 +186,7 @@ impl DB {
                                         msg,
                                         &mut queue,
                                         &mut rx,
-                                        &mem_clone,
-                                        &last_sequence,
+                                        &inner,
                                     ).await;
                                 }
                                 None => {
@@ -224,8 +218,7 @@ impl DB {
         msg: WriteMsg,
         queue: &mut Vec<WriteMsg>,
         rx: &mut mpsc::Receiver<WriteMsg>,
-        mem: &Arc<MemTable>,
-        last_sequence: &Arc<Mutex<SequenceNumber>>,
+        inner: &Arc<Mutex<DBInner>>,
     ) {
         queue.push(msg);
 
@@ -239,20 +232,23 @@ impl DB {
 
         // Process all batched writes
         dbg!(queue.len());
-        let mem_ptr = Arc::as_ptr(mem) as *mut MemTable;
-
+        let (mem, mut sequence) = {
+            let guard = inner.lock().unwrap();
+            (guard.mem.clone(), guard.last_sequence)
+        };
+        let mem_ptr = Arc::as_ptr(&mem) as *mut MemTable;
         for msg in queue.drain(..) {
             for (key, value, value_type) in msg.batch.writes {
-                let seq = {
-                    let mut lastSeq = last_sequence.lock().unwrap();
-                    *lastSeq += 1;
-                    *lastSeq
-                };
+                sequence += 1;
                 unsafe {
-                    (*mem_ptr).add(seq, value_type, &key, &value);
+                    (*mem_ptr).add(sequence, value_type, &key, &value);
                 }
             }
             let _ = msg.resp.send(Ok(()));
+        }
+        {
+            let mut guard = inner.lock().unwrap();
+            guard.last_sequence = sequence;
         }
     }
 
@@ -290,17 +286,13 @@ impl DB {
     }
 
     fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, DBError> {
-        let snapshot = {
-            let last_seq = self.last_sequence.lock().unwrap();
-            *last_seq
-        };
-
-        let (mem, imm, current) = {
+        let (mem, imm, current, snapshot) = {
             let inner = self.inner.lock().unwrap();
             (
                 inner.mem.clone(),
                 inner.imm.clone(),
                 inner.versions.current(),
+                inner.last_sequence,
             )
         };
 
@@ -461,7 +453,18 @@ enum Direction {
 }
 
 impl DBIterator {
-    pub fn new(iterators: Vec<Box<dyn InternalIterator>>, snapshot: SequenceNumber) -> Self {
+    pub fn new(db: &DB) -> Self {
+        let inner = db.inner.lock().unwrap();
+        let snapshot = inner.last_sequence;
+        let mut iterators: Vec<Box<dyn InternalIterator>> =
+            vec![Box::new(MemTableIter::new(&inner.mem))];
+        if let Some(imm) = &inner.imm {
+            iterators.push(Box::new(MemTableIter::new(imm)));
+        }
+        DBIterator::internal_new(iterators, snapshot)
+    }
+
+    fn internal_new(iterators: Vec<Box<dyn InternalIterator>>, snapshot: SequenceNumber) -> Self {
         let iter = MergingIterator::new(iterators);
         DBIterator {
             snapshot,
@@ -932,12 +935,8 @@ mod tests {
                 .unwrap();
         });
 
+        let mut iter = DBIterator::new(&db);
         // 正向遍历
-        let mem = Arc::clone(&db.inner.lock().unwrap().mem);
-        let mut iter = DBIterator::new(
-            vec![Box::new(MemTableIter::new(&mem))],
-            MAX_SEQUENCE_NUMBER, // 使用当前的 sequence number
-        );
         iter.seek_to_first();
         let mut keys = Vec::new();
         let mut values = Vec::new();
@@ -950,10 +949,6 @@ mod tests {
         assert_eq!(values, vec![b"1".to_vec(), b"2".to_vec(), b"3".to_vec()]);
 
         // 反向遍历
-        let mut iter = DBIterator::new(
-            vec![Box::new(MemTableIter::new(&mem))],
-            MAX_SEQUENCE_NUMBER, // 使用当前的 sequence number
-        );
         iter.seek_to_last();
         let mut rev_keys = Vec::new();
         let mut rev_values = Vec::new();
@@ -968,10 +963,6 @@ mod tests {
         );
 
         // seek 到 b
-        let mut iter = DBIterator::new(
-            vec![Box::new(MemTableIter::new(&mem))],
-            MAX_SEQUENCE_NUMBER, // 使用当前的 sequence number
-        );
         iter.seek(b"b");
         assert!(iter.valid());
         assert_eq!(iter.key(), b"b");

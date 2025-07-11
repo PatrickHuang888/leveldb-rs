@@ -461,6 +461,10 @@ impl DBIterator {
         if let Some(imm) = &inner.imm {
             iterators.push(Box::new(MemTableIter::new(imm)));
         }
+        let current = inner.versions.current();
+        if let Some(current) = current {
+            // TODO: 这里需要获取当前版本的所有文件迭代器
+        }
         DBIterator::internal_new(iterators, snapshot)
     }
 

@@ -453,7 +453,7 @@ enum Direction {
 }
 
 impl DBIterator {
-    pub fn new(db: &DB) -> Self {
+    pub fn new(db: &DB) -> Result<Self, DBError> {
         let inner = db.inner.lock().unwrap();
         let snapshot = inner.last_sequence;
         let mut iterators: Vec<Box<dyn InternalIterator>> =
@@ -463,9 +463,9 @@ impl DBIterator {
         }
         let current = inner.versions.current();
         if let Some(current) = current {
-            // TODO: 这里需要获取当前版本的所有文件迭代器
+            current.new_files_iterators(&db.dbname)?;
         }
-        DBIterator::internal_new(iterators, snapshot)
+        Ok(DBIterator::internal_new(iterators, snapshot))
     }
 
     fn internal_new(iterators: Vec<Box<dyn InternalIterator>>, snapshot: SequenceNumber) -> Self {
@@ -939,7 +939,7 @@ mod tests {
                 .unwrap();
         });
 
-        let mut iter = DBIterator::new(&db);
+        let mut iter = DBIterator::new(&db).unwrap();
         // 正向遍历
         iter.seek_to_first();
         let mut keys = Vec::new();

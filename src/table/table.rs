@@ -1,3 +1,5 @@
+use rand::seq::index;
+
 /*
 Table组织形式如下
 
@@ -290,18 +292,19 @@ fn shortest_successor(key: &[u8]) -> Vec<u8> {
     res
 }
 
-pub(crate) struct TableIterator<'a, R: Read + Seek> {
-    r: &'a mut R,
+pub(crate) struct TableIterator<R: Read + Seek> {
+    t: Table<R>,
     index_iter: BlockIter,
     data_iter: Option<BlockIter>,
     valid: bool,
     data_block_handle: Option<BlockHandle>,
 }
-impl<'a, R: Read + Seek> TableIterator<'a, R> {
-    pub(crate) fn new(t: &'a mut Table<R>) -> Self {
+impl<R: Read + Seek> TableIterator<R> {
+    pub(crate) fn new(t: Table<R>) -> Self {
+        let index_iter = BlockIter::new(t.index_block.clone());
         TableIterator {
-            r: &mut t.reader,
-            index_iter: BlockIter::new(t.index_block.clone()),
+            t,
+            index_iter,
             data_iter: None,
             valid: false,
             data_block_handle: None,
@@ -319,8 +322,8 @@ impl<'a, R: Read + Seek> TableIterator<'a, R> {
         {
             let need_reload = !matches!(self.data_block_handle.as_ref(), Some(h) if self.data_iter.is_some() && h == &handle);
             if need_reload {
-                let data_block =
-                    Table::read_block(&mut self.r, &handle).inspect_err(|_| self.valid = false)?;
+                let data_block = Table::read_block(&mut self.t.reader, &handle)
+                    .inspect_err(|_| self.valid = false)?;
                 self.data_iter = Some(BlockIter::new(data_block));
                 self.data_block_handle = Some(handle);
             }
@@ -366,7 +369,7 @@ impl<'a, R: Read + Seek> TableIterator<'a, R> {
     }
 }
 
-impl<R: Read + Seek> InternalIterator for TableIterator<'_, R> {
+impl<R: Read + Seek> InternalIterator for TableIterator<R> {
     fn seek(&mut self, key: &InternalKey) -> Result<(), DBError> {
         self.index_iter.seek(key)?;
         self.init_data_block()?;
@@ -494,8 +497,8 @@ mod tests {
             let builder = TableBuilder::new(Cursor::new(&mut buf));
             builder.finish().unwrap();
         }
-        let mut table = Table::open(Cursor::new(&buf)).unwrap();
-        let mut iter = TableIterator::new(&mut table);
+        let table = Table::open(Cursor::new(&buf)).unwrap();
+        let mut iter = TableIterator::new(table);
         // 空表 valid 应为 false
         assert!(!iter.valid());
         assert!(iter.seek_to_first().is_ok());
@@ -517,8 +520,8 @@ mod tests {
             }
             builder.finish().unwrap();
         }
-        let mut table = Table::open(Cursor::new(&buf)).unwrap();
-        let mut iter = TableIterator::new(&mut table);
+        let table = Table::open(Cursor::new(&buf)).unwrap();
+        let mut iter = TableIterator::new(table);
         // 正序遍历
         iter.seek_to_first().unwrap();
         let mut result = Vec::new();
@@ -564,9 +567,8 @@ mod tests {
             }
             builder.finish().unwrap();
         }
-        let mut table = Table::open(Cursor::new(&buf)).unwrap();
-        let index_block = table.index_block.clone();
-        let mut iter = TableIterator::new(&mut table);
+        let table = Table::open(Cursor::new(&buf)).unwrap();
+        let mut iter = TableIterator::new(table);
 
         // seek 到 "c"，next 应该到 "e"，prev 应该到 "a"
         let ikey = make_internal_key(b"c", 0, b"");
@@ -623,9 +625,8 @@ mod tests {
             }
             builder.finish().unwrap();
         }
-        let mut table = Table::open(Cursor::new(&buf)).unwrap();
-        let index_block = table.index_block.clone();
-        let mut iter = TableIterator::new(&mut table);
+        let table = Table::open(Cursor::new(&buf)).unwrap();
+        let mut iter = TableIterator::new(table);
 
         // 正序遍历
         iter.seek_to_first().unwrap();

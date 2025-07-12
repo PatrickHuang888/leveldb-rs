@@ -1,8 +1,12 @@
 use crate::DBError;
+use crate::db::InternalIterator;
 use crate::db::InternalKey;
 use crate::db::dbformat::ValueType;
 use crate::table::table::Table;
+use crate::table::table::TableIterator;
 use std::fs::File;
+use std::io::Read;
+use std::io::Seek;
 use std::sync::Arc;
 
 const NUM_LEVELS: u64 = 7; // 假设有7个层级
@@ -22,7 +26,7 @@ impl Ord for FileMetaData {
             "Keys must be present"
         );
         if self.smallest_key.as_ref().unwrap() < other.smallest_key.as_ref().unwrap() {
-            return std::cmp::Ordering::Less;
+            std::cmp::Ordering::Less
         } else {
             self.file_number.cmp(&other.file_number)
         }
@@ -190,7 +194,7 @@ impl VersionBuilder {
 }
 
 #[derive(Debug, Clone, Default)]
-pub(super) struct Version {
+pub(crate) struct Version {
     files: [Vec<FileMetaData>; NUM_LEVELS as usize],
 }
 
@@ -301,6 +305,234 @@ impl Version {
                 }
             }
             Err(e) => Err(e.into()),
+        }
+    }
+
+    pub(crate) fn new_files_iterators(
+        &self,
+        dbname: &str,
+    ) -> Result<Vec<Box<dyn InternalIterator>>, DBError> {
+        let mut iterators: Vec<Box<dyn InternalIterator>> = Vec::new();
+
+        // level 0 文件打开，因为overlap，TODO:TableCache 需要处理
+        for file in &self.files[0] {
+            let f = File::open(format!("{}-{}.ldb", dbname, file.file_number))?;
+            let t = Table::open(f)?;
+            let iter = TableIterator::new(t);
+            iterators.push(Box::new(iter));
+        }
+
+        // For levels 1 and above, create ConcatenatingIterator for each level
+        for level_files in &self.files[1..] {
+            if !level_files.is_empty() {
+                let iter = ConcatenatingIterator::new(level_files.clone(), dbname.to_string());
+                iterators.push(Box::new(iter));
+            }
+        }
+        Ok(iterators)
+    }
+}
+
+struct ConcatenatingIterator {
+    index: LevelFileNumIterator,
+    current_table_iter: Option<TableIterator<File>>,
+    dbname: String,
+}
+
+impl ConcatenatingIterator {
+    pub fn new(files: Vec<FileMetaData>, dbname: String) -> Self {
+        ConcatenatingIterator {
+            index: LevelFileNumIterator::new(files),
+            current_table_iter: None,
+            dbname,
+        }
+    }
+
+    fn open_current_file(&mut self) -> Result<(), DBError> {
+        assert!(
+            self.index.valid(),
+            "Index must be valid to open current file"
+        );
+        let file_number = self.index.key().unwrap();
+        let file_path = format!("{}-{}.ldb", self.dbname, file_number);
+        match File::open(file_path) {
+            Ok(file_handle) => {
+                let table = Table::open(file_handle)?;
+                self.current_table_iter = Some(TableIterator::new(table));
+                Ok(())
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    fn skip_empty_files_forward(&mut self) -> Result<(), DBError> {
+        while self.current_table_iter.is_none()
+            || !self.current_table_iter.as_ref().unwrap().valid()
+        {
+            if !self.index.valid() {
+                self.current_table_iter = None;
+                return Ok(());
+            }
+            self.index.next();
+            self.open_current_file()?;
+            if let Some(ref mut iter) = self.current_table_iter {
+                iter.seek_to_first()?;
+            }
+        }
+        Ok(())
+    }
+
+    fn skip_empty_files_backward(&mut self) -> Result<(), DBError> {
+        while self.current_table_iter.is_none()
+            || !self.current_table_iter.as_ref().unwrap().valid()
+        {
+            if !self.index.valid() {
+                self.current_table_iter = None;
+                return Ok(());
+            }
+            self.index.prev();
+            self.open_current_file()?;
+            if let Some(ref mut iter) = self.current_table_iter {
+                iter.seek_to_last()?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl InternalIterator for ConcatenatingIterator {
+    fn valid(&self) -> bool {
+        self.current_table_iter
+            .as_ref()
+            .is_some_and(|iter| iter.valid())
+    }
+
+    fn seek_to_first(&mut self) -> Result<(), DBError> {
+        self.index.seek_to_first();
+        if !self.index.valid() {
+            self.current_table_iter = None;
+            return Ok(());
+        }
+        self.open_current_file()?;
+        if let Some(ref mut iter) = self.current_table_iter {
+            iter.seek_to_first()?;
+        }
+        self.skip_empty_files_forward()?;
+        Ok(())
+    }
+
+    fn seek_to_last(&mut self) -> Result<(), DBError> {
+        self.index.seek_to_last();
+        if !self.index.valid() {
+            self.current_table_iter = None;
+            return Ok(());
+        }
+        self.open_current_file()?;
+        if let Some(ref mut iter) = self.current_table_iter {
+            iter.seek_to_last()?;
+        }
+        self.skip_empty_files_backward()?;
+        Ok(())
+    }
+
+    fn seek(&mut self, key: &InternalKey) -> Result<(), DBError> {
+        self.index.seek(key);
+        self.open_current_file()?;
+        if let Some(ref mut iter) = self.current_table_iter {
+            iter.seek(key)?;
+        }
+        self.skip_empty_files_forward()?;
+        Ok(())
+    }
+
+    fn next(&mut self) -> Result<(), DBError> {
+        assert!(self.valid(), "Cannot call next on an invalid iterator");
+        self.current_table_iter.as_mut().unwrap().next()?;
+        self.skip_empty_files_forward()?;
+        Ok(())
+    }
+
+    fn prev(&mut self) -> Result<(), DBError> {
+        assert!(self.valid(), "Cannot call prev on an invalid iterator");
+        self.current_table_iter.as_mut().unwrap().prev()?;
+        self.skip_empty_files_backward()?;
+        Ok(())
+    }
+
+    fn key(&self) -> Option<&InternalKey> {
+        self.current_table_iter.as_ref()?.key()
+    }
+}
+
+struct LevelFileNumIterator {
+    files: Vec<FileMetaData>,
+    index: usize,
+}
+impl LevelFileNumIterator {
+    fn new(files: Vec<FileMetaData>) -> Self {
+        LevelFileNumIterator { files, index: 0 }
+    }
+
+    fn next(&mut self) {
+        self.index += 1;
+    }
+
+    fn prev(&mut self) {
+        if self.index > 0 {
+            self.index -= 1;
+        } else {
+            self.index = self.files.len(); // 设置为无效状态
+        }
+    }
+
+    fn valid(&self) -> bool {
+        self.index < self.files.len()
+    }
+
+    // 返回当前文件的 file_number
+    fn key(&self) -> Option<u64> {
+        if self.valid() {
+            Some(self.files[self.index].file_number)
+        } else {
+            None
+        }
+    }
+
+    fn seek(&mut self, key: &InternalKey) {
+        // 二分查找第一个 largest_key >= key 的文件
+        let mut left = 0;
+        let mut right = self.files.len();
+
+        while left < right {
+            let mid = (left + right) / 2;
+            if let Some(largest) = &self.files[mid].largest_key {
+                if largest < key {
+                    // Key at "mid.largest" is < "target".  Therefore all
+                    // files at or before "mid" are uninteresting.
+                    left = mid + 1;
+                } else {
+                    // Key at "mid.largest" is >= "target".  Therefore all files
+                    // after "mid" are uninteresting.
+                    right = mid;
+                }
+            } else {
+                // error
+                self.index = self.files.len();
+                return;
+            }
+        }
+        self.index = right;
+    }
+
+    fn seek_to_first(&mut self) {
+        self.index = 0;
+    }
+
+    fn seek_to_last(&mut self) {
+        if !self.files.is_empty() {
+            self.index = self.files.len() - 1;
+        } else {
+            self.index = 0;
         }
     }
 }

@@ -112,6 +112,9 @@ impl DB {
             Arc::clone(&db.has_imm),
         );
 
+        // 报错没关系，也许数据库存在，需要恢复
+        let _ = std::fs::create_dir_all(dbname);
+
         Ok(db)
     }
 

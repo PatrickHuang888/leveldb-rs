@@ -61,3 +61,11 @@ impl WriteableFile {
 fn is_manifested(filename: &str) -> bool {
     filename.starts_with("MANIFEST")
 }
+
+pub(crate) fn descriptor_file_name(dbname: &str, file_number: u64) -> String {
+    format!("{}/MANIFEST-{:06}", dbname, file_number)
+}
+
+pub(crate) fn db_file_name(dbname: &str, file_number: u64) -> String {
+    format!("{}/{:06}.ldb", dbname, file_number)
+}

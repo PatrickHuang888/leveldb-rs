@@ -12,6 +12,7 @@ use crate::db::{
     memtable::{MemTable, MemTableIter},
 };
 use crate::table::table::TableBuilder;
+use crate::util::file::db_file_name;
 use std::fs::OpenOptions;
 use std::fs::remove_file;
 use std::sync::atomic::AtomicBool;
@@ -338,7 +339,7 @@ impl DB {
                 smallest_key: None,
                 largest_key: None,
             };
-            file_path = format!("{}-{}.ldb", dbname, meta.file_number);
+            file_path = db_file_name(dbname, meta.file_number);
             iter = MemTableIter::new(inner_guard.imm.as_ref().unwrap());
         }
 

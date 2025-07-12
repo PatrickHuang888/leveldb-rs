@@ -4,6 +4,7 @@ use crate::db::InternalKey;
 use crate::db::dbformat::ValueType;
 use crate::table::table::Table;
 use crate::table::table::TableIterator;
+use crate::util::file::db_file_name;
 use std::fs::File;
 use std::io::Read;
 use std::io::Seek;
@@ -216,7 +217,7 @@ impl Version {
                 candidates.sort_by(|a, b| b.file_number.cmp(&a.file_number));
 
                 for file in candidates {
-                    let file_path = format!("{}-{}.ldb", dbname, file.file_number);
+                    let file_path = db_file_name(dbname, file.file_number);
                     match self.search_in_file(&file_path, key)? {
                         Some(value) => return Ok(Some(value)),
                         None => continue,
@@ -226,7 +227,7 @@ impl Version {
                 // Level > 0: files are sorted and non-overlapping
                 // Use binary search to find the file that might contain the key
                 if let Some(file) = self.find_file_in_level(level_files, key) {
-                    let file_path = format!("{}-{}.ldb", dbname, file.file_number);
+                    let file_path = db_file_name(dbname, file.file_number);
                     if let Some(value) = self.search_in_file(&file_path, key)? {
                         return Ok(Some(value));
                     }
@@ -316,7 +317,7 @@ impl Version {
 
         // level 0 文件打开，因为overlap，TODO:TableCache 需要处理
         for file in &self.files[0] {
-            let f = File::open(format!("{}-{}.ldb", dbname, file.file_number))?;
+            let f = File::open(db_file_name(dbname, file.file_number))?;
             let t = Table::open(f)?;
             let iter = TableIterator::new(t);
             iterators.push(Box::new(iter));
@@ -354,7 +355,7 @@ impl ConcatenatingIterator {
             "Index must be valid to open current file"
         );
         let file_number = self.index.key().unwrap();
-        let file_path = format!("{}-{}.ldb", self.dbname, file_number);
+        let file_path = db_file_name(&self.dbname, file_number);
         match File::open(file_path) {
             Ok(file_handle) => {
                 let table = Table::open(file_handle)?;

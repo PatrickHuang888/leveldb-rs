@@ -9,6 +9,8 @@ use skiplist::Size;
 
 mod db_impl;
 pub(crate) mod dbformat;
+pub(crate) mod log_reader;
+pub(crate) mod log_writer;
 pub(crate) mod memtable;
 mod skiplist;
 mod version;
